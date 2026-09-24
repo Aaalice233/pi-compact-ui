@@ -188,6 +188,19 @@ describe("交互模式", () => {
 });
 
 describe("卸载", () => {
+	test("/reload 时保留补丁，pi 在新实例启动前重建的历史仍按折叠样式显示", async () => {
+		const fake = createFakePi();
+		extension.default(fake.pi as any);
+		await fake.emit("session_start");
+		await fake.emit("session_shutdown", { reason: "reload" });
+		assert.notEqual(Container.prototype.addChild, originalAddChild);
+
+		const next = createFakePi();
+		extension.default(next.pi as any);
+		await next.emit("session_start");
+		await next.emit("session_shutdown", { reason: "quit" });
+		assert.equal(Container.prototype.addChild, originalAddChild, "多次重装后仍能还原到最初的原型");
+	});
 	test("session_shutdown 还原全部原型补丁", async () => {
 		const fake = createFakePi();
 		extension.default(fake.pi as any);

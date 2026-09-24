@@ -171,4 +171,5 @@ Its main responsibilities are:
 > compact-ui does not re-register any tool. Built-in tool definitions, prompt
 > guidelines, and settings such as `shellPath` stay untouched; the group simply
 > does not render the tool components it owns. Terminal patches are installed
-> only in interactive (TUI) sessions and removed on `session_shutdown`.
+> only in interactive (TUI) sessions and removed on `session_shutdown` (kept
+> across `/reload`, because Pi rebuilds the transcript before the new session starts).

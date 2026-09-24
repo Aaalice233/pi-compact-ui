@@ -1678,7 +1678,7 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", async (event) => {
 		stopConfigWatcher();
 		if (animTimer) {
 			clearTimeout(animTimer);
@@ -1686,9 +1686,10 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (!uiActive) return;
 		uiActive = false;
-		// 还原全局原型，使卸载或禁用后 /reload 即可恢复 pi 原生显示；
-		// 重载时新实例会在自己的 session_start 里重新安装。
-		uninstallPatches();
+		// /reload 时 pi 会在新实例的 session_start 之前就重建对话记录；此时还原补丁
+		// 会让整段历史按原生样式重建。补丁保留到新实例安装时整体替换。
+		// 其他关闭原因才还原全局原型。
+		if ((event as { reason?: string })?.reason !== "reload") uninstallPatches();
 		capturedTui = null;
 	});
 
