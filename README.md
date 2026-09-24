@@ -10,6 +10,31 @@
 
 </div>
 
+
+> [!IMPORTANT]
+> 这是 [pi-compact-ui](https://www.npmjs.com/package/pi-compact-ui) 0.1.3 的个人 fork，
+> 通过 Git 安装：`pi install git:github.com/Aaalice233/pi-compact-ui`。
+
+## Fork 改动
+
+| 问题 | 原因 | 处理 |
+|---|---|---|
+| plan-mode 提交的计划只剩一行 | 所有工具都被收进折叠组，工具自带的 `renderResult` 不再运行 | 新增 `nativeTools` 名单，名单内工具保持原生显示并切分前后组 |
+| 子代理看不到实时进度 | 同上，`subagent` 的进度渲染被折叠组替代 | 默认列入 `nativeTools` |
+| goal-x 待确认目标看不全，续跑回合计时错误 | 草案全文在 `propose_goal_draft` 的 `renderCall` 里；goal-x 续跑用隐藏的 custom 消息开新回合，原版只认 user 消息 | 目标相关 4 个工具列入名单；回合边界改为 `agent_start` |
+| 模型看到的内置工具说明被替换 | 原版重新注册 read/bash 等 7 个工具，说明变成占位文字，丢失 promptGuidelines、`shellPath` 等设置，子代理进程同样受影响 | 不再注册任何工具；补丁只在 TUI 会话安装，关闭会话时还原 |
+| 长会话输出和打字明显卡顿 | 每帧都对全部历史回复逐行裁剪、重拼全部折叠组；每个 token 还会让组内工具重跑自带渲染器 | 回复与静态组按内容缓存；组失效不再级联到组内工具；中断的工具不再无限转圈 |
+
+`npm run bench` 实测（120 列、每轮 1 条回复 + 3 个工具，每帧重绘整棵对话树）：
+
+| 轮数 | 原版 0.1.3 | 本 fork | pi 原生 |
+|---:|---:|---:|---:|
+| 100 | 33 ms/帧 | 0.4 ms/帧 | 1.1 ms/帧 |
+| 500 | 153 ms/帧 | 0.8 ms/帧 | 2.6 ms/帧 |
+| 2000 | 549 ms/帧 | 4.1 ms/帧 | 9.4 ms/帧 |
+
+原版上游没有声明许可证，本仓库保持私有，仅供个人使用。
+
 ## Preview
 
 The collapsed view shows at most three lines by default:
@@ -49,14 +74,15 @@ reasoning content:
 - Renders fenced code blocks as subtle theme-aware background panels with
   syntax highlighting and one character of horizontal padding instead of
   decorative top and bottom border rows.
-- Preserves Pi's native execution semantics for `read`, `bash`, `edit`, `write`,
-  `find`, `grep`, and `ls`.
+- Preserves Pi's native tool definitions and execution semantics.
+- Keeps tools with rich renderers (plan, subagent, goal confirmation) outside
+  the groups via a configurable `nativeTools` list.
 - Gives compaction summaries a distinct, compact presentation.
 
 ## Installation
 
 ```bash
-pi install npm:pi-compact-ui
+pi install git:github.com/Aaalice233/pi-compact-ui
 ```
 
 Reload Pi:
@@ -86,6 +112,7 @@ Available settings:
 | `collapsedMaxLines` | `3` | Maximum lines shown while a group is collapsed |
 | `expandedToolLines` | `5` | Result-preview lines shown for each expanded tool |
 | `expandedThinkingLines` | `10` | Reasoning-preview lines shown while expanded |
+| `nativeTools` | see below | Tools that keep their own renderer and are never grouped; `*` wildcards allowed |
 
 The configuration is stored at:
 
@@ -99,9 +126,22 @@ Example:
 {
   "collapsedMaxLines": 3,
   "expandedToolLines": 5,
-  "expandedThinkingLines": 10
+  "expandedThinkingLines": 10,
+  "nativeTools": [
+    "plan_mode_complete",
+    "subagent",
+    "propose_goal_draft",
+    "create_goal",
+    "set_goal_tasks",
+    "update_goal"
+  ]
 }
 ```
+
+The file is created with defaults on first interactive start. Edits apply as
+soon as the file is saved — no `/reload` needed. Changes affect tool calls
+created afterwards; existing groups are not rebuilt. When `nativeTools` is
+present it replaces the default list entirely.
 
 ## Controls
 
@@ -128,6 +168,7 @@ Its main responsibilities are:
    message boundaries.
 
 > [!NOTE]
-> compact-ui overrides the registration of several built-in tools so it can
-> control their presentation. Actual execution is still delegated to Pi's
-> native tool implementations.
+> compact-ui does not re-register any tool. Built-in tool definitions, prompt
+> guidelines, and settings such as `shellPath` stay untouched; the group simply
+> does not render the tool components it owns. Terminal patches are installed
+> only in interactive (TUI) sessions and removed on `session_shutdown`.

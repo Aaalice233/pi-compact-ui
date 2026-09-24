@@ -12,10 +12,12 @@
  *   └  · thinking: Planning... · ≈1.2K tok
  *
  * Ctrl+O toggles collapse/expand (via setExpanded, same as built-in tools).
- * Expand line counts are configurable via /compact-config (interactive
- * settings menu, arrows to select, Enter to adjust, Esc to close) and are
- * persisted to ~/.pi/agent/compact-ui.json:
- *   { "collapsedMaxLines": 3, "expandedToolLines": 5, "expandedThinkingLines": 10 }
+ * Expand line counts are configurable via /compact-ui-config (interactive
+ * settings menu, arrows to select, Enter to adjust, Esc to close). All
+ * settings live in ~/.pi/agent/compact-ui.json and apply on save:
+ *   { "collapsedMaxLines": 3, "expandedToolLines": 5, "expandedThinkingLines": 10,
+ *     "nativeTools": ["plan_mode_complete", "subagent", ...] }
+ * Tools matched by nativeTools keep their own renderer and are never grouped.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -23,13 +25,6 @@ import {
 	AssistantMessageComponent,
 	CompactionSummaryMessageComponent,
 	ToolExecutionComponent,
-	createBashTool,
-	createEditTool,
-	createFindTool,
-	createGrepTool,
-	createLsTool,
-	createReadTool,
-	createWriteTool,
 	getMarkdownTheme,
 	getSettingsListTheme,
 } from "@earendil-works/pi-coding-agent";
@@ -47,27 +42,106 @@ import {
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import type { Component, DefaultTextStyle, MarkdownTheme, SettingItem } from "@earendil-works/pi-tui";
-import { readFileSync, writeFileSync } from "fs";
+import { existsSync, readFileSync, watch, writeFileSync, type FSWatcher } from "fs";
 import { homedir } from "os";
-import { join } from "path";
+import { basename, dirname, join } from "path";
 
 // =============================================================================
 // Config
 // =============================================================================
-const CONFIG_PATH = join(homedir(), ".pi", "agent", "compact-ui.json");
-const DEFAULT_CONFIG = { collapsedMaxLines: 3, expandedToolLines: 5, expandedThinkingLines: 10 };
-let config = { ...DEFAULT_CONFIG };
-try {
-	config = { ...DEFAULT_CONFIG, ...JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) };
-} catch {
-	// first run — use defaults
+// 与 pi 一致：设置了 PI_CODING_AGENT_DIR 时配置目录随之改变。
+const CONFIG_PATH = join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "compact-ui.json");
+
+/**
+ * 保持原生渲染、不并入折叠组的工具。入选标准：自带渲染器承载了折叠组无法替代、
+ * 用户需要直接看到的内容（计划正文、子代理实时进度、待确认的目标与目标终态）。
+ * 例行调用（get_goal、update_goal_task、各类问答、搜索与 MCP）照常折叠。
+ */
+export const DEFAULT_NATIVE_TOOLS = [
+	// @narumitw/pi-plan-mode：完整计划正文由 renderResult 以 Markdown 渲染。
+	"plan_mode_complete",
+	// pi-subagents：运行中的步骤、进度与前台分离快捷键提示。
+	"subagent",
+	// pi-goal-x：propose_goal_draft 的 renderCall 就是确认对话框打开时可滚动查看的完整目标；
+	// 其余三项是用户确认后的创建结果、任务树与目标终态（完成/审计/暂停）。
+	"propose_goal_draft",
+	"create_goal",
+	"set_goal_tasks",
+	"update_goal",
+] as const;
+
+type CompactConfig = {
+	collapsedMaxLines: number;
+	expandedToolLines: number;
+	expandedThinkingLines: number;
+	nativeTools: string[];
+};
+
+const DEFAULT_CONFIG: CompactConfig = {
+	collapsedMaxLines: 3,
+	expandedToolLines: 5,
+	expandedThinkingLines: 10,
+	nativeTools: [...DEFAULT_NATIVE_TOOLS],
+};
+
+/**
+ * 合并用户配置。字段类型不对时回退默认值，避免一处手写错误让整个扩展失效；
+ * nativeTools 写了就整体替换默认列表，便于用户显式移除某个默认项。
+ */
+export function resolveConfig(raw: unknown): CompactConfig {
+	const source = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+	const numberOr = (key: "collapsedMaxLines" | "expandedToolLines" | "expandedThinkingLines") => {
+		const value = source[key];
+		return typeof value === "number" && Number.isFinite(value) ? value : DEFAULT_CONFIG[key];
+	};
+	const nativeTools = Array.isArray(source.nativeTools)
+		? source.nativeTools.filter((name): name is string => typeof name === "string" && name.trim().length > 0)
+		: [...DEFAULT_CONFIG.nativeTools];
+	return {
+		collapsedMaxLines: numberOr("collapsedMaxLines"),
+		expandedToolLines: numberOr("expandedToolLines"),
+		expandedThinkingLines: numberOr("expandedThinkingLines"),
+		nativeTools,
+	};
+}
+
+let config: CompactConfig = { ...DEFAULT_CONFIG, nativeTools: [...DEFAULT_CONFIG.nativeTools] };
+let nativeToolMatcher = createToolMatcher(config.nativeTools);
+
+/** 名单项支持 `*` 通配符（如 `mcp__*`），其余字符按字面匹配，区分大小写。 */
+export function createToolMatcher(patterns: readonly string[]): (toolName: string) => boolean {
+	const exact = new Set<string>();
+	const wildcards: RegExp[] = [];
+	for (const pattern of patterns) {
+		if (!pattern.includes("*")) {
+			exact.add(pattern);
+			continue;
+		}
+		const escaped = pattern.split("*").map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&"));
+		wildcards.push(new RegExp(`^${escaped.join(".*")}$`));
+	}
+	return (toolName) => exact.has(toolName) || wildcards.some((pattern) => pattern.test(toolName));
+}
+
+function loadConfig(): void {
+	let raw: unknown;
+	try {
+		raw = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
+	} catch (error) {
+		// 文件不存在是首次运行的正常情况；JSON 损坏则保留默认值并提示，而不是静默吞掉。
+		if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") {
+			console.warn(`[compact-ui] 无法读取 ${CONFIG_PATH}，使用默认配置：${(error as Error)?.message ?? error}`);
+		}
+	}
+	config = resolveConfig(raw);
+	nativeToolMatcher = createToolMatcher(config.nativeTools);
 }
 
 function saveConfig(): void {
 	try {
 		writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n");
-	} catch {
-		// ignore
+	} catch (error) {
+		console.warn(`[compact-ui] 无法保存 ${CONFIG_PATH}：${(error as Error)?.message ?? error}`);
 	}
 }
 
@@ -229,6 +303,8 @@ function toolSummary(name: string, args: any): { name: string; content: string }
 	switch (name) {
 		case "bash":
 			return { name: "bash", content: oneLine(args?.command || "…") };
+		case "powershell":
+			return { name: "powershell", content: oneLine(args?.command || "…") };
 		case "read":
 			return { name: "read", content: shortenPath(args?.path || "…") };
 		case "write":
@@ -254,14 +330,17 @@ function toolSummary(name: string, args: any): { name: string; content: string }
 type ToolStatus = "pending" | "success" | "error";
 function toolStatus(tool: any): ToolStatus {
 	if (tool?.result?.isError) return "error";
+	// 运行结束（agent_end）时仍未拿到结果的工具已被中断。若继续按 pending 处理，
+	// 转圈动画会永远每 100ms 请求一次整屏重画。
+	if (tool?._groupInterrupted && !tool?.result) return "error";
 	if (tool?.isPartial === true || (tool?.executionStarted && !tool?.result)) return "pending";
 	return tool?.result ? "success" : "pending";
 }
 
 function toolElapsed(tool: any): string {
 	const start = toolStarts.get(tool.toolCallId) ?? Date.now();
-	const end = tool?.result ? tool._groupEndAt ?? Date.now() : Date.now();
-	return ((end - start) / 1000).toFixed(1);
+	const end = tool?.result || tool?._groupInterrupted ? tool._groupEndAt ?? Date.now() : Date.now();
+	return (Math.max(0, end - start) / 1000).toFixed(1);
 }
 
 function toolResultText(tool: any): string {
@@ -397,11 +476,14 @@ export type CompactExternalGroup = {
  */
 export class CompactExternalGroupComponent implements Component {
 	private expanded = false;
+	readonly state: CompactExternalGroup;
+	private readonly theme: any;
 
-	constructor(
-		readonly state: CompactExternalGroup,
-		private readonly theme: any,
-	) {}
+	// 显式字段而非参数属性：Node 原生的类型擦除不支持参数属性，测试需要直接加载源码。
+	constructor(state: CompactExternalGroup, theme: any) {
+		this.state = state;
+		this.theme = theme;
+	}
 
 	setExpanded(expanded: boolean): void {
 		this.expanded = expanded;
@@ -543,14 +625,31 @@ function installVisibleAssistantMarkdownRendering(component: Markdown): void {
 	if (markdown[MARKDOWN_RENDER_PATCH_KEY]) return;
 	markdown.theme = getCompactMarkdownTheme();
 	const originalRender = markdown.render.bind(markdown);
-	markdown.render = (width: number): string[] =>
-		normalizeCompactCodeBlockLines(originalRender(width), width, Number(markdown.paddingX) || 0);
+	// pi-tui 的 Markdown 在文本与宽度不变时返回同一个缓存数组。按数组身份复用规范化结果，
+	// 否则每帧都要对全部历史回复逐行 truncateToWidth，长会话会被拖到每帧数百毫秒。
+	// 主题变化时 Markdown.invalidate() 会丢弃内部缓存，这里随之失效。
+	let cachedSource: string[] | undefined;
+	let cachedWidth = -1;
+	let cachedLines: string[] = [];
+	markdown.render = (width: number): string[] => {
+		const source = originalRender(width);
+		if (source !== cachedSource || width !== cachedWidth) {
+			cachedLines = normalizeCompactCodeBlockLines(source, width, Number(markdown.paddingX) || 0);
+			cachedSource = source;
+			cachedWidth = width;
+		}
+		return cachedLines;
+	};
 	markdown[MARKDOWN_RENDER_PATCH_KEY] = { originalRender };
 	markdown.invalidate();
 }
 
 class CompactionHeaderComponent implements Component {
-	constructor(private readonly tokensBefore: number) {}
+	private readonly tokensBefore: number;
+
+	constructor(tokensBefore: number) {
+		this.tokensBefore = tokensBefore;
+	}
 
 	render(width: number): string[] {
 		const theme = currentTheme;
@@ -681,27 +780,41 @@ class ToolGroupComponent extends Container {
 	thinkingTokensFrozen = 0;
 	thinkingTokensFrozenExact = false;
 	private markdownPreviewCache = new Map<string, MarkdownPreview>();
+	/**
+	 * 静态（不在转圈）时的渲染结果。历史组每帧都会被整棵对话树重绘调用，
+	 * 不缓存时每组每帧都要重拼并裁剪全部行。key 覆盖了渲染所依赖的全部可变状态，
+	 * 其余变化（主题、配置、思考快照）经 markDirty()/invalidate() 清除。
+	 */
+	private lineCache: { key: string; lines: string[] } | undefined;
 
 	constructor() {
 		super();
 	}
 
 	setExpanded(expanded: boolean): void {
+		// 组内工具不再自己渲染，不转发给它们：转发会触发每个工具重跑原生渲染器，
+		// 长会话里按一次 Ctrl+O 就要重算数百个 diff/高亮。
 		this._expanded = expanded;
-		for (const tool of this.children) tool.setExpanded?.(expanded);
-		this.invalidate();
+		this.markDirty();
 	}
 
 	addTool(tool: any): void {
 		this.children.push(tool);
 		if ((tool as any)._groupedAt === undefined) (tool as any)._groupedAt = Date.now();
 		(tool as any)[PARENT_KEY] = this;
+		this.markDirty();
 	}
 
 	removeTool(tool: any): void {
 		const index = this.children.indexOf(tool);
 		if (index >= 0) this.children.splice(index, 1);
 		if ((tool as any)?.[PARENT_KEY] === this) delete (tool as any)[PARENT_KEY];
+		this.markDirty();
+	}
+
+	/** 组内容变化但主题未变：只丢弃行缓存，Markdown 预览缓存自带 source 校验可继续复用。 */
+	markDirty(): void {
+		this.lineCache = undefined;
 	}
 
 	hasPending(): boolean {
@@ -719,8 +832,10 @@ class ToolGroupComponent extends Container {
 
 	invalidate(): void {
 		// Theme changes and tool/thinking updates must rebuild ANSI markdown.
+		// 不调用 super.invalidate()：ToolExecutionComponent.invalidate() 会重跑工具自带的
+		// 渲染器，而组内工具的输出从不显示，级联只会白白消耗 CPU。
 		this.markdownPreviewCache.clear();
-		super.invalidate();
+		this.lineCache = undefined;
 	}
 
 	private renderMarkdownPreview(
@@ -874,7 +989,7 @@ class ToolGroupComponent extends Container {
 			if (result) {
 				const markdownWidth = Math.max(1, width - GROUP_PADDING_X - sub.length);
 				const preview = this.renderMarkdownPreview(
-					`tool:${tool.toolCallId ?? index}`,
+					`tool:${(tool as any).toolCallId ?? index}`,
 					result,
 					markdownWidth,
 					config.expandedToolLines,
@@ -916,6 +1031,14 @@ class ToolGroupComponent extends Container {
 	}
 
 	render(width: number): string[] {
+		// 转圈或实时思考中的组每帧都在变（动画帧、耗时、流式思考），不缓存；
+		// 其余状态只在下列 key 或 markDirty() 覆盖的事件中变化。
+		const animating = this.needsAnimation();
+		const key = animating
+			? ""
+			: `${width}|${this._expanded ? 1 : 0}|${this.anchored ? 1 : 0}|${this.sealed ? 1 : 0}|${this === lastActiveGroup ? 1 : 0}|${this.children.length}|${this.children.map(toolStatus).join(",")}`;
+		if (!animating && this.lineCache?.key === key) return this.lineCache.lines;
+
 		const lines = this._expanded ? this.renderExpanded(width) : this.renderCollapsed(width);
 		// Indent compact blocks from the transcript edge while keeping every line
 		// within the terminal width (including mobile / narrow terminals).
@@ -926,7 +1049,9 @@ class ToolGroupComponent extends Container {
 		// bypasses that child tree, so restore the same single leading gap while
 		// the group is top-level. Anchored groups receive deterministic spacing
 		// from placeAnchoredGroupBeforeText() instead.
-		return this.anchored ? rendered : ["", ...rendered];
+		const result = this.anchored ? rendered : ["", ...rendered];
+		this.lineCache = animating ? undefined : { key, lines: result };
+		return result;
 	}
 }
 
@@ -963,7 +1088,53 @@ function scheduleAnimation(): void {
 const groups = new Set<ToolGroupComponent>();
 
 function isGroupable(value: any): boolean {
-	return value instanceof ToolExecutionComponent;
+	return value instanceof ToolExecutionComponent && !nativeToolMatcher(String((value as any).toolName ?? ""));
+}
+
+function isNativeTool(value: any): boolean {
+	return value instanceof ToolExecutionComponent && nativeToolMatcher(String((value as any).toolName ?? ""));
+}
+
+function setActiveGroup(group: ToolGroupComponent | null): void {
+	if (lastActiveGroup === group) return;
+	// 旧的活动组不再显示实时思考，需要按冻结快照重绘。
+	lastActiveGroup?.markDirty();
+	lastActiveGroup = group;
+	group?.markDirty();
+}
+
+function resetThinkingState(): void {
+	thinkingActive = false;
+	thinkingText = "";
+	thinkingTokenCount = 0;
+	thinkingTokenCountExact = false;
+	thinkingBlocks.clear();
+	assistantThinkingStarted = false;
+}
+
+/** 封存当前活动组：之后只按快照渲染，新的思考与工具进入下一个组。 */
+function sealActiveGroup(): void {
+	const group = lastActiveGroup;
+	if (!group || group.sealed) return;
+	group.sealed = true;
+	group.thinkingFrozen = thinkingText;
+	group.thinkingTokensFrozen = thinkingTokenCount;
+	group.thinkingTokensFrozenExact = thinkingTokenCountExact;
+	group.markDirty();
+}
+
+/**
+ * 原生渲染的工具是折叠组之间的边界。先封存它前面的活动组，否则该组会一直“打开”：
+ * 思考快照为空，之后的思考还会同时计入两个组。
+ */
+function handleNativeToolBoundary(parent: any, component: any): void {
+	if (!isNativeTool(component) || parent instanceof ToolGroupComponent) return;
+	const group = lastActiveGroup;
+	if (!group || group.sealed || !Array.isArray(parent?.children) || !parent.children.includes(group)) return;
+	sealActiveGroup();
+	resetThinkingState();
+	pendingTextSeal = false;
+	pendingTextOrdinal = null;
 }
 
 function previousGroupable(children: any[], start: number): { child: any; index: number } | undefined {
@@ -991,7 +1162,7 @@ function ensureThinkingGroup(): void {
 	const group = new ToolGroupComponent();
 	children.splice(idx >= 0 ? idx + 1 : children.length, 0, group);
 	groups.add(group);
-	lastActiveGroup = group;
+	setActiveGroup(group);
 	parent.invalidate?.();
 	capturedTui?.requestRender?.();
 }
@@ -1014,19 +1185,10 @@ function flushPendingTextSeal(): void {
 		if (pendingTextOrdinal !== null) {
 			anchorGroupBeforeCurrentText(lastActiveGroup, pendingTextOrdinal);
 		}
-		lastActiveGroup.sealed = true;
-		lastActiveGroup.thinkingFrozen = thinkingText;
-		lastActiveGroup.thinkingTokensFrozen = thinkingTokenCount;
-		lastActiveGroup.thinkingTokensFrozenExact = thinkingTokenCountExact;
-		lastActiveGroup.invalidate();
+		sealActiveGroup();
 		pendingTextSeal = false;
 		pendingTextOrdinal = null;
-		thinkingActive = false;
-		thinkingText = "";
-		thinkingTokenCount = 0;
-		thinkingTokenCountExact = false;
-		thinkingBlocks.clear();
-		assistantThinkingStarted = false;
+		resetThinkingState();
 		return;
 	}
 
@@ -1050,7 +1212,7 @@ function maybeGroup(parent: any, component: any): void {
 	if (prior?.child instanceof ToolGroupComponent && !prior.child.sealed) {
 		children.splice(index, 1);
 		prior.child.addTool(component);
-		lastActiveGroup = prior.child;
+		setActiveGroup(prior.child);
 		return;
 	}
 	// Previous sibling is a bare tool → merge both into a new group.
@@ -1061,7 +1223,7 @@ function maybeGroup(parent: any, component: any): void {
 		(parent as any).children[prior.index] = group;
 		children.splice(index, 1);
 		groups.add(group);
-		lastActiveGroup = group;
+		setActiveGroup(group);
 		return;
 	}
 	// Otherwise (sealed group before, or nothing groupable) → wrap the tool in a
@@ -1070,7 +1232,7 @@ function maybeGroup(parent: any, component: any): void {
 	group.addTool(component);
 	(parent as any).children[index] = group;
 	groups.add(group);
-	lastActiveGroup = group;
+	setActiveGroup(group);
 }
 
 type PatchState = {
@@ -1380,6 +1542,7 @@ function installGrouping(): void {
 					lastStreamingComp = component;
 					flushPendingTextSeal();
 				}
+				handleNativeToolBoundary(this, component);
 				maybeGroup(this, component);
 				stripAssistantPhantomPadding(this, component);
 				restoreAssistantAnchor(this, component);
@@ -1407,7 +1570,7 @@ function installGrouping(): void {
 			}
 			for (const child of [...(this.children ?? [])]) {
 				if (child instanceof ToolGroupComponent) {
-					for (const tool of [...child.children]) delete tool[PARENT_KEY];
+					for (const tool of [...child.children]) delete (tool as any)[PARENT_KEY];
 					groups.delete(child);
 				}
 				releaseAssistantAnchors(child);
@@ -1422,54 +1585,65 @@ function installGrouping(): void {
 }
 
 // =============================================================================
-// Built-in tool delegation (render nothing natively)
+// Patch lifecycle & config file
 // =============================================================================
-type AnyTool = {
-	parameters: unknown;
-	execute: (toolCallId: string, params: unknown, signal: AbortSignal, onUpdate?: unknown, ctx?: unknown) => Promise<unknown>;
-};
 
-const toolCache = new Map<string, Record<string, AnyTool>>();
-function getTools(cwd: string): Record<string, AnyTool> {
-	let tools = toolCache.get(cwd);
-	if (!tools) {
-		tools = {
-			read: createReadTool(cwd),
-			bash: createBashTool(cwd),
-			edit: createEditTool(cwd),
-			write: createWriteTool(cwd),
-			find: createFindTool(cwd),
-			grep: createGrepTool(cwd),
-			ls: createLsTool(cwd),
-		};
-		toolCache.set(cwd, tools);
+/**
+ * 还原本扩展安装的原型补丁。仅当原型上仍是本扩展装的函数时才还原，
+ * 避免覆盖之后其他扩展在同一方法上叠加的补丁。
+ */
+function uninstallPatches(): void {
+	const host = globalThis as any;
+	const grouping = host[PATCH_KEY] as PatchState | undefined;
+	if (grouping) {
+		const prototype = grouping.prototype;
+		for (const method of ["addChild", "removeChild", "clear"] as const) {
+			if (prototype[method] === grouping.installed[method]) prototype[method] = grouping.original[method];
+		}
+		delete host[PATCH_KEY];
 	}
-	return tools;
+
+	const assistant = AssistantMessageComponent.prototype as any;
+	const thinking = assistant[ASSISTANT_THINKING_PATCH_KEY];
+	if (thinking) {
+		if (assistant.updateContent === thinking.installedUpdateContent) assistant.updateContent = thinking.originalUpdateContent;
+		delete assistant[ASSISTANT_THINKING_PATCH_KEY];
+	}
+
+	const compaction = CompactionSummaryMessageComponent.prototype as any;
+	const summary = compaction[COMPACTION_STYLE_PATCH_KEY];
+	if (summary) {
+		if (compaction.updateDisplay === summary.installedUpdateDisplay) compaction.updateDisplay = summary.originalUpdateDisplay;
+		if (compaction.setExpanded === summary.installedSetExpanded) compaction.setExpanded = summary.originalSetExpanded;
+		delete compaction[COMPACTION_STYLE_PATCH_KEY];
+	}
+}
+
+/** 首次运行时写出带默认值的配置文件，让用户有现成的文件可改，而不必先读源码找字段名。 */
+function ensureConfigFile(): void {
+	if (existsSync(CONFIG_PATH)) return;
+	saveConfig();
 }
 
 export default function (pi: ExtensionAPI) {
-	installGrouping();
-	installNativeThinkingSuppression();
-	installCompactionSummaryRendering();
+	// 工厂函数里不装补丁：子代理、print/json 模式也会加载本扩展，它们没有终端界面，
+	// 不应改动全局组件原型。内置工具也不再重新注册：重注册会把模型看到的工具说明
+	// 换成占位文字、丢掉 promptSnippet/promptGuidelines，并忽略 shellPath、
+	// shellCommandPrefix、图片缩放等设置。折叠组本就不渲染组内工具，原生渲染器只在
+	// 工具状态变化时运行一次（ToolGroupComponent 已不再级联 invalidate）。
+	let configWatcher: FSWatcher | undefined;
+	let uiActive = false;
 
-	const delegate = (name: keyof ReturnType<typeof getTools>) =>
-		async (toolCallId: string, params: unknown, signal: AbortSignal, onUpdate?: unknown, ctx?: unknown) => {
-			return getTools((ctx as { cwd: string }).cwd)[name].execute(toolCallId, params, signal, onUpdate);
-		};
-
-	for (const name of ["read", "bash", "edit", "write", "find", "grep", "ls"] as const) {
-		pi.registerTool({
-			name,
-			label: name,
-			description: `Built-in ${name} (rendering handled by compact-ui group).`,
-			parameters: getTools(process.cwd())[name].parameters,
-			execute: delegate(name),
-			renderCall: () => new Text("", 0, 0),
-			renderResult: () => new Text("", 0, 0),
-		});
-	}
+	const stopConfigWatcher = () => {
+		configWatcher?.close();
+		configWatcher = undefined;
+	};
 
 	pi.on("session_start", async (_event, ctx) => {
+		loadConfig();
+		if (ctx.mode !== "tui") return;
+		uiActive = true;
+		ensureConfigFile();
 		currentTheme = ctx.ui.theme;
 		ctx.ui.setHiddenThinkingLabel("");
 		// Capture the TUI instance via setWidget's factory so the animation can
@@ -1481,20 +1655,69 @@ export default function (pi: ExtensionAPI) {
 		installGrouping();
 		installNativeThinkingSuppression();
 		installCompactionSummaryRendering();
+
+		// 名单与行数改完保存即生效，无需 /reload。监听目录而不是文件本身：
+		// 编辑器常用“写临时文件再改名”保存，文件级监听会在第一次保存后失效。
+		stopConfigWatcher();
+		try {
+			let reloadTimer: ReturnType<typeof setTimeout> | undefined;
+			configWatcher = watch(dirname(CONFIG_PATH), (_type, filename) => {
+				if (filename && String(filename) !== basename(CONFIG_PATH)) return;
+				if (reloadTimer) clearTimeout(reloadTimer);
+				// 一次保存会触发多个事件，合并后再读，也避免读到写到一半的文件。
+				reloadTimer = setTimeout(() => {
+					reloadTimer = undefined;
+					loadConfig();
+					for (const g of groups) g.invalidate();
+					capturedTui?.requestRender?.();
+				}, 150);
+			});
+			configWatcher.on("error", stopConfigWatcher);
+		} catch (error) {
+			console.warn(`[compact-ui] 无法监听配置文件，修改后需 /reload：${(error as Error)?.message ?? error}`);
+		}
+	});
+
+	pi.on("session_shutdown", async () => {
+		stopConfigWatcher();
+		if (animTimer) {
+			clearTimeout(animTimer);
+			animTimer = null;
+		}
+		if (!uiActive) return;
+		uiActive = false;
+		// 还原全局原型，使卸载或禁用后 /reload 即可恢复 pi 原生显示；
+		// 重载时新实例会在自己的 session_start 里重新安装。
+		uninstallPatches();
+		capturedTui = null;
 	});
 
 	pi.on("tool_execution_start", async (event) => {
 		toolStarts.set(event.toolCallId, Date.now());
-		lastActiveGroup?.invalidate();
+		lastActiveGroup?.markDirty();
 	});
 
 	pi.on("tool_execution_end", async (event) => {
 		for (const g of groups) {
 			for (const t of g.children as any[]) {
-				if (t.toolCallId === event.toolCallId) t._groupEndAt = Date.now();
+				if (t.toolCallId === event.toolCallId) {
+					t._groupEndAt = Date.now();
+					g.markDirty();
+				}
 			}
 		}
-		lastActiveGroup?.invalidate();
+	});
+
+	// 以运行为单位划分回合。pi-goal-x 的自动续跑、pi-subagents 的完成通知等会用隐藏的
+	// custom 消息触发新一轮，没有 user 消息；只看 user 消息会让 "worked for" 把上一轮之后的
+	// 空闲时间也算进去，并把上一轮残留的思考带进新组。
+	pi.on("agent_start", async () => {
+		sealActiveGroup();
+		turnStartMs = Date.now();
+		resetThinkingState();
+		handledTextIndexes.clear();
+		pendingTextSeal = false;
+		pendingTextOrdinal = null;
 	});
 
 	pi.on("message_start", async (event) => {
@@ -1502,21 +1725,11 @@ export default function (pi: ExtensionAPI) {
 		// A new user message is a hard turn boundary: seal whatever block is still
 		// open. Assistant/toolResult message boundaries do NOT seal — thinking and
 		// tool calls stay in one block until real (non-thinking) text appears.
-		if (role === "user" && lastActiveGroup && !lastActiveGroup.sealed) {
-			lastActiveGroup.sealed = true;
-			lastActiveGroup.thinkingFrozen = thinkingText;
-			lastActiveGroup.thinkingTokensFrozen = thinkingTokenCount;
-			lastActiveGroup.thinkingTokensFrozenExact = thinkingTokenCountExact;
-		}
 		if (role === "user") {
-			turnStartMs = Date.now();
-			thinkingActive = false;
-			thinkingText = "";
-			thinkingTokenCount = 0;
-			thinkingTokenCountExact = false;
+			sealActiveGroup();
+			if (!turnStartMs) turnStartMs = Date.now();
+			resetThinkingState();
 			handledTextIndexes.clear();
-			thinkingBlocks.clear();
-			assistantThinkingStarted = false;
 			pendingTextSeal = false;
 			pendingTextOrdinal = null;
 			lastStreamingComp = null;
@@ -1587,29 +1800,30 @@ export default function (pi: ExtensionAPI) {
 
 		// Refresh the active block when thinking starts/stops (event-driven only;
 		// no timer, so the transcript scroll position is never yanked around).
-		lastActiveGroup?.invalidate();
+		lastActiveGroup?.markDirty();
 	});
 
 	pi.on("agent_end", async () => {
 		// Turn finished: freeze the final block so it stops spinning and shows a
 		// stable summary until the user starts the next turn.
-		if (lastActiveGroup && !lastActiveGroup.sealed) {
-			lastActiveGroup.sealed = true;
-			lastActiveGroup.thinkingFrozen = thinkingText;
-			lastActiveGroup.thinkingTokensFrozen = thinkingTokenCount;
-			lastActiveGroup.thinkingTokensFrozenExact = thinkingTokenCountExact;
+		sealActiveGroup();
+		// 运行已结束却仍未拿到结果的工具（参数流式到一半被中止等）按中断处理，
+		// 否则它们的转圈会让动画定时器永远每 100ms 重画一次。
+		const endedAt = Date.now();
+		for (const g of groups) {
+			for (const t of g.children as any[]) {
+				if (toolStatus(t) !== "pending") continue;
+				t._groupInterrupted = true;
+				t._groupEndAt ??= endedAt;
+				g.markDirty();
+			}
 		}
 		// Separate the final visible text from the preceding work with a divider
 		// that reports how long this turn ran.
-		const elapsedMs = Date.now() - turnStartMs;
-		insertTurnDivider(elapsedMs);
-		thinkingActive = false;
-		thinkingText = "";
-		thinkingTokenCount = 0;
-		thinkingTokenCountExact = false;
+		if (turnStartMs) insertTurnDivider(endedAt - turnStartMs);
+		turnStartMs = 0;
+		resetThinkingState();
 		handledTextIndexes.clear();
-		thinkingBlocks.clear();
-		assistantThinkingStarted = false;
 		pendingTextSeal = false;
 		pendingTextOrdinal = null;
 	});
@@ -1620,7 +1834,7 @@ export default function (pi: ExtensionAPI) {
 			// Non-TUI modes (print/json) can't show the interactive menu.
 			if (!ctx.hasUI) {
 				ctx.ui.notify(
-					`compact: collapsedMaxLines=${config.collapsedMaxLines}, expandedToolLines=${config.expandedToolLines}, expandedThinkingLines=${config.expandedThinkingLines}`,
+					`compact: collapsedMaxLines=${config.collapsedMaxLines}, expandedToolLines=${config.expandedToolLines}, expandedThinkingLines=${config.expandedThinkingLines}, nativeTools=${config.nativeTools.join(",")} (${CONFIG_PATH})`,
 					"info",
 				);
 				return;
@@ -1666,6 +1880,8 @@ export default function (pi: ExtensionAPI) {
 		if (changed) {
 			ctx.ui.notify("compact-ui settings saved", "info");
 		}
+		// 名单是字符串列表，不适合步进器编辑；提示配置文件位置，保存后自动生效。
+		ctx.ui.notify(`Native tools (${config.nativeTools.length}): edit "nativeTools" in ${CONFIG_PATH}; changes apply on save`, "info");
 	},
 });
 }
