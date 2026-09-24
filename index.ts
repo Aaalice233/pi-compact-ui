@@ -739,19 +739,32 @@ function installNativeThinkingSuppression(): void {
 			? previous.originalUpdateContent
 			: (prototype.updateContent as (this: any, message: any, isStreaming?: boolean) => void);
 	const installedUpdateContent = function (this: any, message: any, isStreaming?: boolean): void {
-		const content = Array.isArray(message?.content) ? message.content : undefined;
-		if (!content?.some((item: any) => item?.type === "thinking")) {
-			originalUpdateContent.call(this, message, isStreaming);
-			return;
+		// /reload 在新实例启动前已创建历史组件；新模块的 WeakMap/WeakSet 不认识它们。
+		// 在更新入口重新登记容器与展开代理，不能只依赖构造期间的 addChild 补丁。
+		if (!assistantContentContainers.has(this.contentContainer)) {
+			assistantContentContainers.add(this.contentContainer);
+			getAssistantContentState(this.contentContainer);
+			installAssistantExpansion(this, this.contentContainer);
 		}
-		originalUpdateContent.call(
-			this,
-			{
-				...message,
-				content: content.filter((item: any) => item?.type !== "thinking"),
-			},
-			isStreaming,
-		);
+		const streaming = isStreaming ?? this.isStreaming;
+		if (streaming) streamedAssistants.add(this);
+		const content = Array.isArray(message?.content) ? message.content : [];
+		// 历史组件没有流式事件，必须从消息重建；实时组件最终会收到 false，但思考已由
+		// message_update 收集，不能在结束帧再建一份。invalidate() 不传 isStreaming，沿用原值。
+		if (!streamedAssistants.has(this)) restoreHistoricalThinking(this, content, message?.usage?.reasoning);
+		const presentation = content.some((item: any) => item?.type === "thinking")
+			? { ...message, content: content.filter((item: any) => item?.type !== "thinking") }
+			: message;
+		originalUpdateContent.call(this, presentation, isStreaming);
+		// 原生组件会保存传入的消息供主题/布局重建使用；只保留过滤版会永久丢掉历史思考。
+		this.lastMessage = message;
+		const tail = assistantContentStates.get(this.contentContainer)?.historyTail;
+		if (tail) {
+			// 放在正文之后、错误/中断提示之前；纯思考消息也必须有可展开的入口。
+			const children = this.contentContainer.children;
+			const diagnostic = children.findIndex((child: any) => child instanceof Text);
+			children.splice(diagnostic < 0 ? children.length : diagnostic, 0, new Spacer(1), tail);
+		}
 	};
 	prototype.updateContent = installedUpdateContent;
 	prototype[ASSISTANT_THINKING_PATCH_KEY] = {
@@ -1250,6 +1263,7 @@ type PatchState = {
 // it) makes the gap between a folded tool group and the following text look too
 // large. We strip the empty Text so only pi's normal single Spacer remains.
 const assistantContentContainers = new WeakSet<Container>();
+const streamedAssistants = new WeakSet<AssistantMessageComponent>();
 type AssistantContentState = {
 	/** Sealed groups keyed by the visible Markdown block they precede. */
 	anchors: Map<number, ToolGroupComponent>;
@@ -1257,6 +1271,10 @@ type AssistantContentState = {
 	nextTextOrdinal: number;
 	/** Turn-duration divider bound to the final visible Markdown ordinal. */
 	finalDivider?: { ordinal: number; component: any };
+	/** 历史消息独占的思考组；正文前用 anchors 定位，末尾没有正文则单独保留。 */
+	historyGroups?: Map<number, ToolGroupComponent>;
+	historyTail?: ToolGroupComponent;
+	expanded?: boolean;
 };
 const assistantContentStates = new WeakMap<Container, AssistantContentState>();
 const groupAnchors = new WeakMap<ToolGroupComponent, { container: Container; ordinal: number }>();
@@ -1268,6 +1286,46 @@ function getAssistantContentState(container: Container): AssistantContentState {
 		assistantContentStates.set(container, state);
 	}
 	return state;
+}
+
+/**
+ * 只恢复当前组件收到的历史消息，不扫描会话文件，避免把其他分支或已压缩内容带回来。
+ * 相邻思考按下一段可见正文定位；没有正文的思考（如工具调用前的消息）保留在消息末尾。
+ */
+function restoreHistoricalThinking(component: any, content: any[], reportedTokens: unknown): void {
+	const container = component.contentContainer as Container;
+	const state = getAssistantContentState(container);
+	const runs = new Map<number, string[]>();
+	let ordinal = 0;
+	for (const block of content) {
+		if (block?.type === "text" && String(block.text ?? "").trim()) ordinal++;
+		if (block?.type !== "thinking" || !String(block.thinking ?? "").trim()) continue;
+		const chunks = runs.get(ordinal) ?? [];
+		chunks.push(String(block.thinking).trim());
+		runs.set(ordinal, chunks);
+	}
+	const previous = state.historyGroups ?? new Map<number, ToolGroupComponent>();
+	for (const [index, group] of previous) {
+		if (state.anchors.get(index) === group) state.anchors.delete(index);
+		if (!runs.has(index)) groups.delete(group);
+	}
+	state.historyTail = undefined;
+	state.historyGroups = new Map();
+	for (const [index, chunks] of runs) {
+		const group = previous.get(index) ?? new ToolGroupComponent();
+		group.sealed = true;
+		group.anchored = true;
+		group.thinkingFrozen = chunks.join("\n\n");
+		// provider 的 usage 是整条消息总数，多组时无法准确分配，不给每组重复标总数。
+		const exact = runs.size === 1 && typeof reportedTokens === "number" && Number.isFinite(reportedTokens) && reportedTokens > 0;
+		group.thinkingTokensFrozen = exact ? reportedTokens : estimateTextTokens(group.thinkingFrozen);
+		group.thinkingTokensFrozenExact = exact;
+		group.setExpanded(state.expanded ?? false);
+		groups.add(group);
+		state.historyGroups.set(index, group);
+		if (index < ordinal) state.anchors.set(index, group);
+		else state.historyTail = group;
+	}
 }
 
 function removeGroupFromContainer(container: any, group: ToolGroupComponent): void {
@@ -1414,7 +1472,9 @@ function installAssistantExpansion(component: AssistantMessageComponent, content
 	(component as any).setExpanded = (expanded: boolean) => {
 		const state = assistantContentStates.get(contentContainer);
 		if (!state) return;
+		state.expanded = expanded;
 		for (const group of state.anchors.values()) group.setExpanded(expanded);
+		state.historyTail?.setExpanded(expanded);
 		contentContainer.invalidate();
 	};
 }
@@ -1473,12 +1533,15 @@ function releaseAssistantAnchors(component: any): void {
 	if (!(contentContainer instanceof Container)) return;
 	const state = assistantContentStates.get(contentContainer);
 	if (!state) return;
-	for (const group of state.anchors.values()) {
+	const ownedGroups = new Set([...state.anchors.values(), ...(state.historyGroups?.values() ?? [])]);
+	for (const group of ownedGroups) {
 		for (const tool of [...group.children]) delete (tool as any)[PARENT_KEY];
 		groupAnchors.delete(group);
 		groups.delete(group);
 	}
 	state.anchors.clear();
+	state.historyGroups?.clear();
+	state.historyTail = undefined;
 	state.finalDivider = undefined;
 }
 

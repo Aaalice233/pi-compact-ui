@@ -143,6 +143,17 @@ soon as the file is saved — no `/reload` needed. Changes affect tool calls
 created afterwards; existing groups are not rebuilt. When `nativeTools` is
 present it replaces the default list entirely.
 
+## 历史思考恢复
+
+恢复或切换会话、重建当前分支、压缩后显示保留消息以及 `/reload` 时，会从每条仍保留的助手消息恢复思考块。正文前后的思考按原顺序显示；纯思考消息和工具调用前的思考也有折叠入口。`Ctrl+O` 展开，预览行数仍由 `expandedThinkingLines` 控制，**并非无限制显示全文**。
+
+- 只改变显示，不改写会话记录或发给模型的内容；实时消息结束时不会再重复生成历史组。
+- 主题变化、宽度调整、重复重建后保留思考和展开状态；已完成的历史组使用缓存，不启动转圈。
+- 无法恢复供应商未返回的思考、加密思考，或已从当前会话分支/压缩投影中移除的原文。
+- plan-mode、subagent 和 goal-x 的 `nativeTools` 名单继续生效。
+
+验证：`npm test` 使用真实 Pi 组件检查历史/流式渲染、顺序、去重、窄屏与独立模块重载；`npm run check` 检查类型。`npm run bench -- --thinking` 覆盖带历史思考的长会话缓存路径。自动测试不代替真实终端中的人工观感验收。
+
 ## Controls
 
 | Action | Key |

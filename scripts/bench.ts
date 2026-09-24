@@ -12,6 +12,8 @@ initTheme("dark");
 
 const WIDTH = 120;
 const FRAMES = 20;
+// 单独覆盖恢复历史的路径：每条回复带可恢复思考，不依赖流式事件。
+const withThinking = process.argv.includes("--thinking");
 const ui = { requestRender() {} };
 const reply = (i: number) =>
 	`第 ${i} 轮结论：修改了 **配置解析** 与缓存。\n\n- 要点一：${"说明文字 ".repeat(12)}\n- 要点二：\`index.ts\`\n\n\`\`\`ts\nconst value = ${i};\nconsole.log(value);\n\`\`\``;
@@ -25,7 +27,7 @@ function buildTranscript(rounds: number): InstanceType<typeof Container> {
 			chat.addChild(tool);
 			tool.updateResult({ content: [{ type: "text", text: "line\n".repeat(20) }], details: undefined, isError: false } as any, false);
 		}
-		chat.addChild(new AssistantMessageComponent({ role: "assistant", content: [{ type: "text", text: reply(i) }] } as any));
+		chat.addChild(new AssistantMessageComponent({ role: "assistant", content: [...(withThinking ? [{ type: "thinking", thinking: `历史思考 ${i}：核对配置、状态与行为。` }] : []), { type: "text", text: reply(i) }] } as any));
 	}
 	return chat;
 }
@@ -49,6 +51,6 @@ for (const n of rounds.length ? rounds : [100, 500, 2000]) {
 	const compact = measure(buildTranscript(n));
 	await handlers.get("session_shutdown")!({}, ctx);
 	console.log(
-		`${n} 轮：原生 ${native.lines} 行 ${native.ms.toFixed(2)}ms/帧；compact-ui ${compact.lines} 行 ${compact.ms.toFixed(2)}ms/帧`,
+		`${n} 轮${withThinking ? "（含历史思考）" : ""}：原生 ${native.lines} 行 ${native.ms.toFixed(2)}ms/帧；compact-ui ${compact.lines} 行 ${compact.ms.toFixed(2)}ms/帧`,
 	);
 }
