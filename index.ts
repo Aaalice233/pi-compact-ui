@@ -282,34 +282,40 @@ function updateThinkingTokenCount(message: any): void {
 	thinkingTokenCountExact = false;
 }
 
-function toolSummary(name: string, args: any): { name: string; content: string } {
+/**
+ * 调用摘要只受行宽约束，不再用固定字符上限。固定上限会把长命令提前截断，
+ * 让摘要在宽终端上也只显示一半；maxWidth 同时是扫描上限，避免超长命令每帧全量处理。
+ */
+function toolSummary(name: string, args: any, maxWidth: number): { name: string; content: string } {
+	const text = (value: unknown) => oneLine(value, maxWidth);
+	const path = (value: unknown) => oneLine(shortenPath(String(value || "…")), maxWidth);
 	switch (name) {
 		case "bash":
-			return { name: "bash", content: oneLine(args?.command || "…") };
+			return { name: "bash", content: text(args?.command || "…") };
 		case "powershell":
-			return { name: "powershell", content: oneLine(args?.command || "…") };
+			return { name: "powershell", content: text(args?.command || "…") };
 		case "read":
-			return { name: "read", content: shortenPath(args?.path || "…") };
+			return { name: "read", content: path(args?.path || "…") };
 		case "write":
 		case "edit":
-			return { name, content: shortenPath(args?.path || "…") };
+			return { name, content: path(args?.path || "…") };
 		case "find":
-			return { name: "find", content: `${oneLine(args?.pattern || "")} in ${shortenPath(args?.path || ".")}` };
+			return { name: "find", content: `${text(args?.pattern || "")} in ${path(args?.path || ".")}` };
 		case "grep":
-			return { name: "grep", content: `${oneLine(args?.pattern || "")} in ${shortenPath(args?.path || ".")}` };
+			return { name: "grep", content: `${text(args?.pattern || "")} in ${path(args?.path || ".")}` };
 		case "ls":
-			return { name: "ls", content: shortenPath(args?.path || ".") };
+			return { name: "ls", content: path(args?.path || ".") };
 		case "web_search":
-			return { name: "web_search", content: oneLine(args?.query || "…") };
+			return { name: "web_search", content: text(args?.query || "…") };
 		case "subagent":
-			return { name: "subagent", content: oneLine(args?.agent || args?.task || "…") };
+			return { name: "subagent", content: text(args?.agent || args?.task || "…") };
 		case "mcp":
-			return { name: "mcp", content: oneLine(args?.tool ?? args?.search ?? args?.describe ?? args?.server ?? "…") };
+			return { name: "mcp", content: text(args?.tool ?? args?.search ?? args?.describe ?? args?.server ?? "…") };
 		case "mcpScript":
-			return { name: "mcpScript", content: oneLine(args?.code ?? "…") };
+			return { name: "mcpScript", content: text(args?.code ?? "…") };
 		default: {
 			const preferred = args?.path ?? args?.query ?? args?.name ?? args?.description ?? args?.url;
-			return { name, content: oneLine(preferred ?? "…") };
+			return { name, content: text(preferred ?? "…") };
 		}
 	}
 }
@@ -400,39 +406,62 @@ function latestPending<T>(tools: T[], status: (tool: T) => ToolStatus): T | unde
 	return undefined;
 }
 
-/** 行主体（不含耗时）：耗时单独成列，所以内容与时间必须分开组装。 */
-function toolRowContent(theme: any, rail: string, name: string, args: any, status: ToolStatus,
-	detail: string, width: number, nameWidth: number): string {
+/** 行主体与右列元数据分开组装：edit 增减、行范围、退出码与耗时共用右列，才能跨行对齐。 */
+interface ToolRowParts {
+	content: string;
+	/** 结果摘要（`+11 −8`、`12–40 行` 等）；错误正文属于内容，不进这一列。 */
+	metric: string;
+	/** 耗时；历史调用与不足 0.1s 的调用为空。 */
+	elapsed: string;
+}
+
+function toolRowParts(theme: any, rail: string, name: string, args: any, status: ToolStatus,
+	detail: string, width: number, nameWidth: number): Omit<ToolRowParts, "elapsed"> {
 	const fg = (color: string, value: string) => theme?.fg?.(color, value) ?? value;
-	const summary = toolSummary(name, args);
+	const summary = toolSummary(name, args, width);
 	const title = truncateToWidth(oneLine(summary.name, nameWidth), nameWidth, "…");
 	const paddedTitle = title + " ".repeat(Math.max(0, nameWidth - visibleWidth(title)));
 	const icon = status === "pending" ? "·" : status === "error" ? "✗" : "✓";
 	const stateColor = status === "error" ? "error" : status === "pending" ? "accent" : "dim";
-	const payload = status === "error" && detail
+	const failed = status === "error";
+	// 错误正文比统计数字重要，留在行内；窄屏只留正文。
+	const payload = failed && detail
 		? width >= 64 ? `${oneLine(summary.content, 28)} · ${detail}` : detail
 		: summary.content;
-	const left = `${fg("dim", rail)}${fg(stateColor, icon)} ${fg("toolTitle", paddedTitle)}  ${fg(status === "error" ? "error" : "muted", payload)}`;
+	const content = `${fg("dim", rail)}${fg(stateColor, icon)} ${fg("toolTitle", paddedTitle)}  ${fg(failed ? "error" : "muted", payload)}`;
+	if (failed || !detail) return { content, metric: "" };
 	// 缓存只保存计数文本，颜色在渲染时取主题，避免主题切换后保留旧色。
-	const diff = status !== "error" ? /^\+(\d+) [−-](\d+)$/.exec(detail) : null;
-	const detailText = status === "error" ? "" : diff
+	const diff = /^\+(\d+) [−-](\d+)$/.exec(detail);
+	const metric = diff
 		? `${fg("toolDiffAdded", `+${diff[1]}`)} ${fg("toolDiffRemoved", `−${diff[2]}`)}`
-		: detail ? fg("dim", detail) : "";
-	return detailText ? `${left} ${detailText}` : left;
+		: fg("dim", detail);
+	return { content, metric };
 }
 
-/** 耗时列紧跟本组最宽的一行，不贴到终端最右；窄屏宁可不要耗时也要保住正文。 */
-function timeColumnFor(contents: string[], timeWidth: number, available: number): number {
-	const widest = contents.reduce((max, content) => Math.max(max, visibleWidth(content)), 0);
-	return Math.max(1, Math.min(widest + 1, available - timeWidth - 1));
-}
-
-function joinToolRow(theme: any, content: string, elapsed: string, available: number, column: number): string {
-	if (!elapsed || available < MIN_TIMED_ROW_WIDTH) return truncateToWidth(content, available, "…");
-	const timeWidth = visibleWidth(elapsed);
-	const width = Math.max(1, Math.min(column, available - timeWidth - 1));
-	const body = truncateToWidth(content, width, "…");
-	return `${body}${" ".repeat(Math.max(1, width - visibleWidth(body)))}${theme?.fg?.("dim", elapsed) ?? elapsed}`;
+/**
+ * 组装一组行：右列（结果摘要 + 耗时）跨行对齐，列位置由最宽的一行决定，不贴终端最右。
+ * 窄屏（或没有右列内容）时只留行主体，优先保住工具与错误正文。
+ */
+function layoutToolRows(theme: any, rows: ToolRowParts[], available: number): string[] {
+	const width = Math.max(1, available);
+	const metricWidth = rows.reduce((max, row) => Math.max(max, visibleWidth(row.metric)), 0);
+	const timeWidth = rows.reduce((max, row) => Math.max(max, visibleWidth(row.elapsed)), 0);
+	// 没有耗时可显示时（历史调用、不足 0.1s），结果摘要仍要右对齐成列，不能一起消失。
+	const metaWidth = metricWidth + (metricWidth && timeWidth ? 1 : 0) + timeWidth;
+	if (!metaWidth || width < MIN_TIMED_ROW_WIDTH) return rows.map((row) => truncateToWidth(row.content, width, "…"));
+	const widest = rows.reduce((max, row) => Math.max(max, visibleWidth(row.content)), 0);
+	const column = Math.max(1, Math.min(widest + 1, width - metaWidth - 1));
+	const fg = (color: string, value: string) => theme?.fg?.(color, value) ?? value;
+	const padLeft = (text: string, target: number) => " ".repeat(Math.max(0, target - visibleWidth(text))) + text;
+	return rows.map((row) => {
+		const body = truncateToWidth(row.content, column, "…");
+		const gap = " ".repeat(Math.max(1, column - visibleWidth(body)));
+		const metric = row.metric ? padLeft(row.metric, metricWidth) : "";
+		const time = row.elapsed ? fg("dim", padLeft(row.elapsed, timeWidth)) : "";
+		// 只有摘要而没有耗时的行尾不再补空列，避免行尾空白。
+		const meta = time ? `${metric || " ".repeat(metricWidth)}${metricWidth ? " " : ""}${time}` : metric;
+		return meta ? `${body}${gap}${meta}` : body;
+	});
 }
 
 const resultSummaryCache = new WeakMap<object, string>();
@@ -628,16 +657,13 @@ export class CompactExternalGroupComponent implements Component {
 		return oneLine(tool.resultText.slice(0, 4096).split("\n").find((line) => line.trim()), 100) || "执行失败";
 	}
 
-	/** 行主体先全部算完再统一取耗时列，组内时间才能对齐到同一列。 */
+	/** 行主体先全部算完再统一排版，右列（结果摘要 + 耗时）才能对齐到同一列。 */
 	private toolLines(rows: Array<{ rail: string; tool: CompactExternalTool }>, width: number): string[] {
-		const available = Math.max(1, width - GROUP_PADDING_X);
 		const column = nameColumn(rows.map((row) => row.tool), width, (tool) => tool.name);
-		const contents = rows.map((row) =>
-			toolRowContent(this.theme, row.rail, row.tool.name, row.tool.args, row.tool.status, this.detail(row.tool), width, column));
-		const elapsed = rows.map((row) => this.elapsed(row.tool));
-		const timeWidth = elapsed.reduce((max, value) => Math.max(max, visibleWidth(value)), 0);
-		const timeColumn = timeColumnFor(contents, timeWidth, available);
-		return contents.map((content, index) => joinToolRow(this.theme, content, elapsed[index]!, available, timeColumn));
+		return layoutToolRows(this.theme, rows.map((row) => ({
+			...toolRowParts(this.theme, row.rail, row.tool.name, row.tool.args, row.tool.status, this.detail(row.tool), width, column),
+			elapsed: this.elapsed(row.tool),
+		})), Math.max(1, width - GROUP_PADDING_X));
 	}
 
 	private tokenLabel(): string {
@@ -1002,15 +1028,12 @@ class ToolGroupComponent extends Container {
 	}
 
 	private toolLines(rows: Array<{ rail: string; tool: any }>, width: number): string[] {
-		const available = Math.max(1, width - GROUP_PADDING_X);
 		const column = nameColumn(rows.map((row) => row.tool), width, (tool) => tool.toolName);
-		const contents = rows.map((row) =>
-			toolRowContent(currentTheme, row.rail, row.tool.toolName, row.tool.args, toolStatus(row.tool), resultSummary(row.tool), width, column));
-		// 历史工具没有原始计时，toolElapsed 返回空串，它就不会影响耗时列的列宽。
-		const elapsed = rows.map((row) => toolElapsed(row.tool));
-		const timeWidth = elapsed.reduce((max, value) => Math.max(max, visibleWidth(value)), 0);
-		const timeColumn = timeColumnFor(contents, timeWidth, available);
-		return contents.map((content, index) => joinToolRow(currentTheme, content, elapsed[index]!, available, timeColumn));
+		// 历史工具没有原始计时，elapsed 为空串，不影响右列列宽。
+		return layoutToolRows(currentTheme, rows.map((row) => ({
+			...toolRowParts(currentTheme, row.rail, row.tool.toolName, row.tool.args, toolStatus(row.tool), resultSummary(row.tool), width, column),
+			elapsed: toolElapsed(row.tool),
+		})), Math.max(1, width - GROUP_PADDING_X));
 	}
 	// Live state only applies to the not-yet-sealed (active) block.
 	private liveThinking(): string {

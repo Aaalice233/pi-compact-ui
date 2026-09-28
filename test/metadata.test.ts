@@ -89,6 +89,76 @@ test("毫秒级调用不显示 0.0s，也不占用同组的耗时列", async () 
 	}
 });
 
+test("结果摘要与耗时共用右列，跨行对齐且不贴正文", async () => {
+	const now = Date.now;
+	try {
+		Date.now = () => 1000;
+		await fake.emit("agent_start");
+		const chat = new Container();
+		chat.addChild(new AssistantMessageComponent({ role: "assistant", content: [] } as any));
+		const build = (name: string, id: string, path: string) => {
+			const component = new ToolExecutionComponent(name, id, { path }, {}, { name } as any, { requestRender() {} } as any, process.cwd());
+			chat.addChild(component);
+			return component;
+		};
+		await fake.emit("tool_execution_start", { toolCallId: "edit-a" });
+		const edit = build("edit", "edit-a", "src/auth.ts");
+		await fake.emit("tool_execution_start", { toolCallId: "edit-b" });
+		const narrow = build("edit", "edit-b", "src/user.ts");
+		await fake.emit("tool_execution_start", { toolCallId: "read-a" });
+		const read = build("read", "read-a", "src/session.ts");
+		Date.now = () => 2200;
+		edit.updateResult({ content: [{ type: "text", text: "ok" }], details: { diff: "@@ -1,1 +1,1 @@\n-old\n+new\n" }, isError: false } as any, false);
+		narrow.updateResult({ content: [{ type: "text", text: "ok" }], details: { diff: `@@ -1,2 +1,10 @@\n${"+added\n".repeat(10)}${"-gone\n".repeat(2)}` }, isError: false } as any, false);
+		read.updateResult({ content: [{ type: "text", text: "ok" }], details: undefined, isError: false } as any, false);
+		for (const id of ["edit-a", "edit-b", "read-a"]) await fake.emit("tool_execution_end", { toolCallId: id });
+		const group = chat.children.find((child: any) => child.toolName === "group") as any;
+		const toolRows = (width: number) => group.render(width).map(stripTerminalSequences).filter((line: string) => line.trim()).slice(1);
+		const rows = toolRows(160);
+		const timeStart = (row: string) => visibleWidth(row.slice(0, row.lastIndexOf(" ") + 1));
+		assert.match(rows[0]!, /src\/auth\.ts\s+\+1 −1 1\.2s$/, "增减紧接耗时，同处右列");
+		assert.match(rows[1]!, /src\/user\.ts\s+\+10 −2 1\.2s$/, "较宽的增减右对齐后与耗时同列");
+		assert.match(rows[2]!, /src\/session\.ts\s+1\.2s$/, "没有摘要的行只显示耗时");
+		assert.equal(new Set(rows.map(timeStart)).size, 1, "三行耗时在同一列");
+		assert.ok(timeStart(rows[0]!) < 60, `右列不能贴到终端右边缘（实际第 ${timeStart(rows[0]!)} 列）`);
+		assert.deepEqual(toolRows(240), rows, "终端变宽不能把右列拉到远端");
+		chat.clear();
+	} finally {
+		Date.now = now;
+		await fake.emit("agent_end");
+	}
+});
+
+test("长命令只受行宽限制，不再被固定字符数提前截断", async () => {
+	const now = Date.now;
+	const command = 'cd "C:/Users/Administrator/.pi/agent/git/github.com/Aaalice233/pi-compact-ui" && git add -A && git status --short && git log --oneline -3';
+	try {
+		Date.now = () => 1000;
+		await fake.emit("agent_start");
+		const chat = new Container();
+		chat.addChild(new AssistantMessageComponent({ role: "assistant", content: [] } as any));
+		await fake.emit("tool_execution_start", { toolCallId: "long" });
+		const tool = new ToolExecutionComponent("bash", "long", { command }, {}, { name: "bash" } as any, { requestRender() {} } as any, process.cwd());
+		chat.addChild(tool);
+		Date.now = () => 2500;
+		tool.updateResult({ content: [{ type: "text", text: "ok" }], details: undefined, isError: false } as any, false);
+		await fake.emit("tool_execution_end", { toolCallId: "long" });
+		const group = chat.children.find((child: any) => child.toolName === "group") as any;
+		const wide = group.render(200).map(stripTerminalSequences).filter((line: string) => line.trim())[1]!;
+		assert.ok(wide.includes(`git status --short`), "宽终端下命令应完整显示");
+		assert.ok(wide.includes(command.slice(60, 80)), "超过 60 字符的部分不能被固定上限截掉");
+		assert.doesNotMatch(wide, /…/);
+		const narrow = group.render(70).map(stripTerminalSequences).filter((line: string) => line.trim())[1]!;
+		assert.match(narrow, /1\.5s$/);
+		assert.ok(visibleWidth(narrow) <= 70, "窄终端仍然不溢出");
+		assert.ok(narrow.length < wide.length, "窄终端仍然按行宽截断");
+		chat.clear();
+	} finally {
+		Date.now = now;
+		await fake.emit("agent_end");
+	}
+});
+
 test("折叠标题累计多个成功编辑，排除失败、进行中和未知 diff", async () => {
 	await fake.emit("agent_start");
 	const chat = new Container();
