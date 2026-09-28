@@ -15,7 +15,7 @@
  * Expand line counts are configurable via /compact-ui-config (interactive
  * settings menu, arrows to select, Enter to adjust, Esc to close). All
  * settings live in ~/.pi/agent/compact-ui.json and apply on save:
- *   { "collapsedMaxLines": 3, "expandedToolLines": 5, "expandedThinkingLines": 10,
+ *   { "collapsedMaxLines": 3, "expandedThinkingLines": 10,
  *     "nativeTools": ["plan_mode_complete", "subagent", ...] }
  * Tools matched by nativeTools keep their own renderer and are never grouped.
  */
@@ -72,14 +72,12 @@ export const DEFAULT_NATIVE_TOOLS = [
 
 type CompactConfig = {
 	collapsedMaxLines: number;
-	expandedToolLines: number;
 	expandedThinkingLines: number;
 	nativeTools: string[];
 };
 
 const DEFAULT_CONFIG: CompactConfig = {
 	collapsedMaxLines: 3,
-	expandedToolLines: 5,
 	expandedThinkingLines: 10,
 	nativeTools: [...DEFAULT_NATIVE_TOOLS],
 };
@@ -90,7 +88,7 @@ const DEFAULT_CONFIG: CompactConfig = {
  */
 export function resolveConfig(raw: unknown): CompactConfig {
 	const source = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
-	const numberOr = (key: "collapsedMaxLines" | "expandedToolLines" | "expandedThinkingLines") => {
+	const numberOr = (key: "collapsedMaxLines" | "expandedThinkingLines") => {
 		const value = source[key];
 		const meta = CONFIG_KEYS.find((item) => item.id === key)!;
 		return typeof value === "number" && Number.isFinite(value)
@@ -101,7 +99,6 @@ export function resolveConfig(raw: unknown): CompactConfig {
 		: [...DEFAULT_CONFIG.nativeTools];
 	return {
 		collapsedMaxLines: numberOr("collapsedMaxLines"),
-		expandedToolLines: numberOr("expandedToolLines"),
 		expandedThinkingLines: numberOr("expandedThinkingLines"),
 		nativeTools,
 	};
@@ -155,14 +152,6 @@ const CONFIG_KEYS = [
 		description: "工具组折叠时的总行数（含标题和思考预览）",
 		min: 2,
 		max: 20,
-		step: 1,
-	},
-	{
-		id: "expandedToolLines",
-		label: "工具预览",
-		description: "展开后，每个工具显示的结果行数",
-		min: 1,
-		max: 50,
 		step: 1,
 	},
 	{
@@ -353,14 +342,6 @@ function toolElapsed(tool: any): string {
 	if ((tool?.result || tool?._groupInterrupted) && tool._groupEndAt === undefined) return "";
 	const end = tool._groupEndAt ?? Date.now();
 	return `${(Math.max(0, end - start) / 1000).toFixed(1)}s`;
-}
-
-function toolResultText(tool: any): string {
-	return (tool?.result?.content ?? [])
-		.filter((c: any) => c.type === "text")
-		.map((c: any) => String(c.text))
-		.join("\n")
-		.trim();
 }
 
 // 元数据紧跟关联内容，不随终端变宽被推到远端；窄屏仍优先保留工具与错误正文。
@@ -683,18 +664,11 @@ export class CompactExternalGroupComponent implements Component {
 		for (let index = 0; index < this.state.tools.length; index++) {
 			const tool = this.state.tools[index]!;
 			const last = index === this.state.tools.length - 1 && !hasThinking;
-			const sub = last ? "    " : "│   ";
-			lines.push(this.toolRow(last ? "╰  " : "├  ", tool, width, column));
-			for (const row of this.markdownLines(
-				tool.resultText,
-				Math.max(1, width - GROUP_PADDING_X - sub.length),
-				config.expandedToolLines,
-				"toolOutput",
-			)) {
-				lines.push(`${fg("dim", sub)}${row}`);
-			}
+			lines.push(this.toolRow(last ? "╰  " : "│  ", tool, width, column));
 		}
-		if (this.state.thinking.trim()) {
+		if (hasThinking && this.state.tools.length > 0) {
+			lines.push(thinkingPreview(this.theme, this.state.thinking, width));
+		} else if (hasThinking) {
 			lines.push(
 				`${fg("dim", "╰  ")}${fg("thinkingText", "思考")} ${fg("muted", `· ${this.tokenLabel()}`)}`,
 			);
@@ -1031,7 +1005,7 @@ class ToolGroupComponent extends Container {
 		return lines;
 	}
 
-	// Expanded: per-tool detail + thinking, line counts configurable.
+	// 一级展开只显示完整工具清单；返回正文不参与渲染，也不做 Markdown 解析。
 	private renderExpanded(width: number): string[] {
 		const theme = currentTheme;
 		const fg = (color: string, text: string) => theme?.fg?.(color, text) ?? text;
@@ -1043,30 +1017,14 @@ class ToolGroupComponent extends Container {
 		for (let index = 0; index < total; index++) {
 			const tool = this.children[index];
 			const isLast = index === total - 1 && !hasThinking;
-			const rail = isLast ? "╰  " : "├  ";
-			const sub = isLast ? "    " : "│   ";
+			const rail = isLast ? "╰  " : "│  ";
 			lines.push(this.toolRow(rail, tool, width, column));
-			const result = toolResultText(tool);
-			if (result) {
-				const markdownWidth = Math.max(1, width - GROUP_PADDING_X - sub.length);
-				const preview = this.renderMarkdownPreview(
-					`tool:${(tool as any).toolCallId ?? index}`,
-					result,
-					markdownWidth,
-					config.expandedToolLines,
-					{ color: (text) => currentTheme?.fg?.("toolOutput", text) ?? text },
-				);
-				for (const row of preview.lines) {
-					lines.push(`${fg("dim", sub)}${row}`);
-				}
-				if (preview.truncated) {
-					lines.push(`${fg("dim", sub)}${fg("muted", "…")}`);
-				}
-			}
 		}
 
 		const tText = this.liveThinking().trim();
-		if (tText) {
+		if (tText && total > 0) {
+			lines.push(thinkingPreview(theme, tText, width));
+		} else if (tText) {
 			lines.push(
 				`${fg("dim", "╰  ")}${fg("thinkingText", "思考")} ${fg("muted", `· ${this.liveThinkingTokenLabel()}`)}`,
 			);
@@ -1946,7 +1904,7 @@ export default function (pi: ExtensionAPI) {
 			// Non-TUI modes (print/json) can't show the interactive menu.
 			if (ctx.mode !== "tui") {
 				ctx.ui.notify(
-					`compact: collapsedMaxLines=${config.collapsedMaxLines}, expandedToolLines=${config.expandedToolLines}, expandedThinkingLines=${config.expandedThinkingLines}, nativeTools=${config.nativeTools.join(",")} (${CONFIG_PATH})`,
+					`compact: collapsedMaxLines=${config.collapsedMaxLines}, expandedThinkingLines=${config.expandedThinkingLines}, nativeTools=${config.nativeTools.join(",")} (${CONFIG_PATH})`,
 					"info",
 				);
 				return;

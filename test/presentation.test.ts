@@ -3,7 +3,7 @@ import { createFakePi, plainTheme } from "./helpers.ts";
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import { AssistantMessageComponent, initTheme, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
-import { Container, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
+import { Container, Markdown, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import extension, { CompactExternalGroupComponent, resolveConfig, type CompactExternalGroup } from "../index.ts";
 
 initTheme("dark");
@@ -69,7 +69,8 @@ test("宽终端的标题 token 和工具耗时就近显示，不填充整行", (
 
 test("设置中的行数按整数和范围约束，非法值不导致超长渲染", () => {
 	const config = resolveConfig({ collapsedMaxLines: -10, expandedToolLines: 1.9, expandedThinkingLines: 1e9 });
-	assert.deepEqual([config.collapsedMaxLines, config.expandedToolLines, config.expandedThinkingLines], [2, 1, 100]);
+	assert.deepEqual([config.collapsedMaxLines, config.expandedThinkingLines], [2, 100]);
+	assert.equal("expandedToolLines" in config, false, "旧返回正文预览设置不再使用");
 });
 
 test("主会话与外部视图保持失败语义，静态缓存不再执行渲染器", async () => {
@@ -89,6 +90,33 @@ test("主会话与外部视图保持失败语义，静态缓存不再执行渲�
 	assert.match(lines.join("\n"), /失败诊断/);
 	assert.doesNotMatch(lines.join("\n"), /0\.0s/);
 	chat.clear();
+});
+
+test("一级展开显示完整平铺列表，不解析返回正文或混排多行思考", async () => {
+	await fake.emit("agent_start");
+	const chat = new Container();
+	chat.addChild(new AssistantMessageComponent({ role: "assistant", content: [] } as any));
+	for (let i = 0; i < 20; i++) {
+		const tool = new ToolExecutionComponent("read", `list-${i}`, { path: `tool-${i}.ts` }, {}, { name: "read" } as any, { requestRender() {} } as any, process.cwd());
+		chat.addChild(tool);
+		tool.updateResult({ content: [{ type: "text", text: `返回正文标记-${i}\n` + "代码或日志\n".repeat(100) }], details: undefined, isError: false }, false);
+	}
+	await fake.emit("agent_end");
+	const group = chat.children.find((child: any) => child.toolName === "group") as any;
+	group.thinkingFrozen = "思考摘要\n" + "思考后文\n".repeat(100);
+	group.setExpanded(true);
+	const original = Markdown.prototype.render;
+	let parses = 0;
+	Markdown.prototype.render = function (width) { parses++; return original.call(this, width); };
+	try {
+		const lines = group.render(120).map(stripTerminalSequences);
+		assert.equal(lines.length, 1 + 1 + 20 + 1, "组前空行、标题、20 个工具、一行思考摘要");
+		assert.deepEqual(lines.filter((line: string) => /✓ read/.test(line)).map((line: string) => /tool-(\d+)\.ts/.exec(line)![1]), Array.from({ length: 20 }, (_, i) => String(i)));
+		assert.doesNotMatch(lines.join("\n"), /返回正文标记|代码或日志/);
+		assert.equal(parses, 0, "展开工具列表不应解析结果或思考 Markdown");
+		assert.match(lines.at(-1)!, /╰.*思考摘要/);
+		assert.equal(group.render(120), group.render(120));
+	} finally { Markdown.prototype.render = original; chat.clear(); }
 });
 
 test("主题失效后颜色重新计算，静态内容保持一致", () => {

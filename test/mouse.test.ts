@@ -52,7 +52,8 @@ test("外部组单击标题切换，空白/正文/拖选/滚轮/修饰键不抢�
 	assert.equal(result?.focus, undefined, "不要夺走编辑器焦点");
 	assert.equal(result?.capture, undefined);
 	assert.equal(result?.target.component, group);
-	assert.match(plain(group).join("\n"), /测试输出详情/);
+	assert.equal(plain(group).length, 1 + data.tools.length, "一级展开只有标题和每个工具一行");
+	assert.doesNotMatch(plain(group).join("\n"), /测试输出详情/);
 	assert.equal(group.handleMouse(mouse(0))?.handled, true);
 	assert.deepEqual(plain(group), collapsed);
 });
@@ -84,7 +85,8 @@ test("真实 Container 路由标题点击，只展开该组且不调用隐藏工
 	assert.equal(chat.handleMouse(mouse(row, { height: lines.length }))?.target.component, groups[0]);
 	assert.equal(groups[0].expanded, true);
 	assert.equal(groups[1].expanded, false);
-	assert.match(plain(chat).join("\n"), /a详细输出/);
+	assert.match(plain(chat).join("\n"), /read.*a\.ts/);
+	assert.doesNotMatch(plain(chat).join("\n"), /a详细输出/);
 	assert.equal(renders, beforeRenders, "点击不应走隐藏工具的原生渲染/鼠标布局");
 	groups[0].setExpanded(false);
 	assert.match(plain(chat)[row]!, /▸ read ×1/);

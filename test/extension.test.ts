@@ -122,7 +122,8 @@ describe("交互模式", () => {
 		group.setExpanded(true);
 		const expanded = group.render(80);
 		assert.notEqual(expanded, first);
-		assert.match(expanded.join("\n"), /done/);
+		assert.match(expanded.join("\n"), /read.*r2\.ts/);
+		assert.doesNotMatch(expanded.join("\n"), /done/, "一级展开不显示返回正文");
 	});
 
 	test("组失效不级联到组内工具，避免重跑第三方渲染器", () => {
