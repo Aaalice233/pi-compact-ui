@@ -33,19 +33,38 @@ test("折叠严格三行，失败项不被较新的成功项掩盖", () => {
 	assert.doesNotMatch(lines.join("\n"), /tools done|tool calling|thinking:/);
 });
 
-test("中文、emoji、长工具名在极窄到宽屏都不溢出；时间列对齐", () => {
+test("中文、emoji、长工具名在极窄到宽屏都不溢出；耗时紧跟内容", () => {
 	const state = fixture();
 	state.tools[0]!.name = "mcp__长工具名称😀_超长后缀";
 	const component = new CompactExternalGroupComponent(state, plainTheme);
 	for (const expanded of [false, true]) {
 		component.setExpanded(expanded);
-		for (const width of [1, 2, 5, 12, 20, 36, 60, 80, 120]) {
+		for (const width of [1, 2, 5, 12, 20, 36, 60, 80, 120, 240]) {
 			assert.ok(component.render(width).every((line) => visibleWidth(line) <= width), `${width}/${expanded}`);
 		}
 	}
 	const timed = component.render(80).filter((line) => /\d\.\ds$/.test(line));
 	assert.equal(timed.length, 3);
-	assert.ok(timed.every((line) => visibleWidth(line) === 80));
+	assert.ok(timed.every((line) => /\S · \d\.\ds$/.test(line)));
+	assert.deepEqual(component.render(240).filter((line) => /\d\.\ds$/.test(line)), timed, "终端变宽不能拉开内容与耗时");
+});
+
+test("宽终端的标题 token 和工具耗时就近显示，不填充整行", () => {
+	const state = fixture();
+	state.tools = [
+		{ id: "1", name: "bash", args: { command: "pi --help 2>&1 | head -60" }, status: "success", resultText: "", startedAt: 0, endedAt: 9700 },
+		{ id: "2", name: "bash", args: { command: "pi list 2>&1" }, status: "success", resultText: "", startedAt: 0, endedAt: 5000 },
+	];
+	state.thinking = "";
+	const component = new CompactExternalGroupComponent(state, plainTheme);
+	assert.deepEqual(component.render(240), [
+		" ▸ 2 个工具",
+		" │  ✓ bash  pi --help 2>&1 | head -60 · 9.7s",
+		" ╰  ✓ bash  pi list 2>&1 · 5.0s",
+	]);
+	state.thinking = "检查帮助信息";
+	assert.equal(component.render(240)[0], " ▸ 2 个工具 · 思考 1.2K");
+	assert.equal(component.render(80)[0], component.render(240)[0]);
 });
 
 test("设置中的行数按整数和范围约束，非法值不导致超长渲染", () => {

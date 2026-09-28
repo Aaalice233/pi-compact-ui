@@ -7,8 +7,8 @@
  * merged into the same block.
  *
  * Collapsed (max 3 lines by default, configurable):
- *   ▸ 3 个工具 · 1 失败                  思考 1.2K
- *   │  ✗ bash  npm test · 断言失败             3.2s
+ *   ▸ 3 个工具 · 1 失败 · 思考 1.2K
+ *   │  ✗ bash  npm test · 断言失败 · 3.2s
  *   ╰  验证过期会话分支……
  *
  * Ctrl+O toggles collapse/expand (via setExpanded, same as built-in tools).
@@ -363,13 +363,11 @@ function toolResultText(tool: any): string {
 		.trim();
 }
 
-// 主会话和子代理视图共用排版：状态有文字兜底，元数据右对齐，窄屏先让出元数据。
-function alignRow(left: string, right: string, width: number): string {
+// 元数据紧跟关联内容，不随终端变宽被推到远端；窄屏仍优先保留工具与错误正文。
+function appendMetadata(content: string, metadata: string, width: number): string {
 	const available = Math.max(1, width);
-	if (!right || available < 36) return truncateToWidth(left, available, "…");
-	const rightWidth = visibleWidth(right);
-	const clipped = truncateToWidth(left, Math.max(1, available - rightWidth - 2), "…");
-	return clipped + " ".repeat(Math.max(1, available - visibleWidth(clipped) - rightWidth)) + right;
+	if (!metadata || available < 36) return truncateToWidth(content, available, "…");
+	return truncateToWidth(content, Math.max(1, available - visibleWidth(metadata)), "…") + metadata;
 }
 
 function groupHeading(theme: any, tools: any[], status: (tool: any) => ToolStatus, expanded: boolean,
@@ -382,7 +380,7 @@ function groupHeading(theme: any, tools: any[], status: (tool: any) => ToolStatu
 	const detail = failed ? fg("error", ` · ${failed} 失败`) : pending ? fg("accent", ` · ${pending} 运行中`) : "";
 	const icon = working ? fg("accent", frame) : fg("muted", expanded ? "▾" : "▸");
 	const title = `${icon} ${fg(working ? "accent" : "muted", label)}${detail}`;
-	return alignRow(title, thinking ? fg("dim", `思考 ${tokens}`) : "", width - GROUP_PADDING_X);
+	return appendMetadata(title, thinking ? fg("dim", ` · 思考 ${tokens}`) : "", width - GROUP_PADDING_X);
 }
 
 function selectedTools<T>(tools: T[], limit: number, status: (tool: T) => ToolStatus): T[] {
@@ -408,7 +406,8 @@ function compactToolRow(theme: any, rail: string, name: string, args: any, statu
 		? width >= 64 ? `${oneLine(summary.content, 28)} · ${detail}` : detail
 		: summary.content;
 	const left = `${fg("dim", rail)}${fg(stateColor, icon)} ${fg("toolTitle", paddedTitle)}  ${fg(status === "error" ? "error" : "muted", payload)}`;
-	return alignRow(left, fg("dim", [status !== "error" ? detail : "", elapsed].filter(Boolean).join(" · ")), width - GROUP_PADDING_X);
+	const metadata = [status !== "error" ? detail : "", elapsed].filter(Boolean).join(" · ");
+	return appendMetadata(left, metadata ? fg("dim", ` · ${metadata}`) : "", width - GROUP_PADDING_X);
 }
 
 const resultSummaryCache = new WeakMap<object, string>();
