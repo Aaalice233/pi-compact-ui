@@ -30,13 +30,13 @@ describe("配置解析", () => {
 	test("缺省时使用默认原生名单", () => {
 		const config = resolveConfig(undefined);
 		assert.deepEqual(config.nativeTools, [...DEFAULT_NATIVE_TOOLS]);
-		assert.equal(config.collapsedMaxLines, 3);
+		assert.equal(config.expandedThinkingLines, 10);
 	});
 
 	test("nativeTools 整体替换默认值，非法项被丢弃", () => {
-		const config = resolveConfig({ nativeTools: ["subagent", 3, "", "mcp__*"], collapsedMaxLines: "x" });
+		const config = resolveConfig({ nativeTools: ["subagent", 3, "", "mcp__*"], expandedThinkingLines: "x" });
 		assert.deepEqual(config.nativeTools, ["subagent", "mcp__*"]);
-		assert.equal(config.collapsedMaxLines, 3);
+		assert.equal(config.expandedThinkingLines, 10);
 	});
 
 	test("名单支持 * 通配符并按字面匹配其余字符", () => {
@@ -166,7 +166,9 @@ describe("交互模式", () => {
 		assert.equal(group.needsAnimation(), true);
 		await fake.emit("agent_end");
 		assert.equal(group.needsAnimation(), false);
-		assert.match(group.render(80).join("\n"), /✗ bash/);
+		assert.match(group.render(80).join("\n"), /bash ×1 · 1 失败/);
+		group.setExpanded(true);
+		assert.match(group.render(80).join("\n"), /✗ bash.*已中断/);
 	});
 
 	test("修改配置文件后无需重载即生效", async () => {

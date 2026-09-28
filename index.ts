@@ -6,16 +6,14 @@
  * in the transcript. Thinking text is captured from message_update events and
  * merged into the same block.
  *
- * Collapsed (max 3 lines by default, configurable):
+ * Completed groups collapse to one header; running groups show at most one pending tool.
  *   ▸ bash ×1 · edit ×2 · read ×1 · 思考 1.2K
- *   │  ✗ bash  npm test · 断言失败 (3.2s)
- *   ╰  验证过期会话分支……
  *
  * Fullscreen header clicks toggle one group; Ctrl+O sets expansion globally via setExpanded.
- * Expand line counts are configurable via /compact-ui-config (interactive
+ * Thinking preview line counts are configurable via /compact-ui-config (interactive
  * settings menu, arrows to select, Enter to adjust, Esc to close). All
  * settings live in ~/.pi/agent/compact-ui.json and apply on save:
- *   { "collapsedMaxLines": 3, "expandedThinkingLines": 10,
+ *   { "expandedThinkingLines": 10,
  *     "nativeTools": ["plan_mode_complete", "subagent", ...] }
  * Tools matched by nativeTools keep their own renderer and are never grouped.
  */
@@ -71,13 +69,11 @@ export const DEFAULT_NATIVE_TOOLS = [
 ] as const;
 
 type CompactConfig = {
-	collapsedMaxLines: number;
 	expandedThinkingLines: number;
 	nativeTools: string[];
 };
 
 const DEFAULT_CONFIG: CompactConfig = {
-	collapsedMaxLines: 3,
 	expandedThinkingLines: 10,
 	nativeTools: [...DEFAULT_NATIVE_TOOLS],
 };
@@ -88,7 +84,7 @@ const DEFAULT_CONFIG: CompactConfig = {
  */
 export function resolveConfig(raw: unknown): CompactConfig {
 	const source = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
-	const numberOr = (key: "collapsedMaxLines" | "expandedThinkingLines") => {
+	const numberOr = (key: "expandedThinkingLines") => {
 		const value = source[key];
 		const meta = CONFIG_KEYS.find((item) => item.id === key)!;
 		return typeof value === "number" && Number.isFinite(value)
@@ -98,7 +94,6 @@ export function resolveConfig(raw: unknown): CompactConfig {
 		? source.nativeTools.filter((name): name is string => typeof name === "string" && name.trim().length > 0)
 		: [...DEFAULT_CONFIG.nativeTools];
 	return {
-		collapsedMaxLines: numberOr("collapsedMaxLines"),
 		expandedThinkingLines: numberOr("expandedThinkingLines"),
 		nativeTools,
 	};
@@ -146,14 +141,6 @@ function saveConfig(): void {
 
 // Interactive editor metadata for each numeric option.
 const CONFIG_KEYS = [
-	{
-		id: "collapsedMaxLines",
-		label: "折叠行数",
-		description: "工具组折叠时的总行数（含标题和思考预览）",
-		min: 2,
-		max: 20,
-		step: 1,
-	},
 	{
 		id: "expandedThinkingLines",
 		label: "思考预览",
@@ -328,9 +315,8 @@ function toolSummary(name: string, args: any): { name: string; content: string }
 type ToolStatus = "pending" | "success" | "error";
 function toolStatus(tool: any): ToolStatus {
 	if (tool?.result?.isError) return "error";
-	// 运行结束（agent_end）时仍未拿到结果的工具已被中断。若继续按 pending 处理，
-	// 转圈动画会永远每 100ms 请求一次整屏重画。
-	if (tool?._groupInterrupted && !tool?.result) return "error";
+	// 运行结束时，只有部分结果的工具也属于中断；不能继续保留进度行或驱动动画。
+	if (tool?._groupInterrupted && (!tool?.result || tool?.isPartial === true)) return "error";
 	if (tool?.isPartial === true || (tool?.executionStarted && !tool?.result)) return "pending";
 	return tool?.result ? "success" : "pending";
 }
@@ -368,10 +354,23 @@ function groupHeading(theme: any, tools: any[], status: (tool: any) => ToolStatu
 		: working ? "正在思考" : "思考记录";
 	const detail = (failed ? fg("error", ` · ${failed} 失败`) : "") + (pending ? fg("accent", ` · ${pending} 运行中`) : "");
 	const icon = fg("muted", expanded ? "▾" : "▸") + (working ? ` ${fg("accent", frame)}` : "");
+	let added = 0;
+	let removed = 0;
+	let hasDiff = false;
+	for (const tool of tools) {
+		if ((tool.toolName ?? tool.name) !== "edit" || status(tool) !== "success") continue;
+		// 复用已完成结果的统计缓存，只累计真实 diff，失败或缺失数据不能当作零改动。
+		const diff = /^\+(\d+) [−-](\d+)$/.exec(resultSummary(tool));
+		if (!diff) continue;
+		hasDiff = true;
+		added += Number(diff[1]);
+		removed += Number(diff[2]);
+	}
+	const changes = hasDiff ? ` ${fg("toolDiffAdded", `+${added}`)} ${fg("toolDiffRemoved", `−${removed}`)}` : "";
 	const available = Math.max(1, width - GROUP_PADDING_X);
 	const usage = thinking ? fg("dim", ` · 思考 ${tokens}`) : "";
-	// 窄屏先省略 token，再裁剪工具摘要；不能把失败/运行状态裁成无意义的「1 …」。
-	const suffix = detail + (visibleWidth(`${icon} ${label}${detail}${usage}`) <= available ? usage : "");
+	// 窄屏先省略 token，再裁剪工具摘要，保留编辑增减与失败/运行状态。
+	const suffix = changes + detail + (visibleWidth(`${icon} ${label}${changes}${detail}${usage}`) <= available ? usage : "");
 	const title = truncateToWidth(label, Math.max(1, available - visibleWidth(`${icon} ${suffix}`)), "…");
 	return truncateToWidth(`${icon} ${fg(working ? "accent" : "muted", title)}${suffix}`, available, "…");
 }
@@ -392,15 +391,12 @@ function clickGroupHeader(component: Component, event: TuiMouseEvent, row: numbe
 	};
 }
 
-function selectedTools<T>(tools: T[], limit: number, status: (tool: T) => ToolStatus): T[] {
-	// 先保留失败和运行中的工具，再补最近的成功项；显示顺序仍按调用时间。
-	const priority = [...tools].reverse();
-	const chosen = new Set<T>();
-	for (const tool of [...priority.filter((item) => status(item) === "error"), ...priority.filter((item) => status(item) === "pending"), ...priority]) {
-		if (chosen.size >= limit) break;
-		chosen.add(tool);
+function latestPending<T>(tools: T[], status: (tool: T) => ToolStatus): T | undefined {
+	// 收起时只展示仍在执行的最新调用，不让成功历史或已处理的失败持续占据正文空间。
+	for (let index = tools.length - 1; index >= 0; index--) {
+		if (status(tools[index]!) === "pending") return tools[index];
 	}
-	return tools.filter((tool) => chosen.has(tool));
+	return undefined;
 }
 
 function compactToolRow(theme: any, rail: string, name: string, args: any, status: ToolStatus,
@@ -426,7 +422,7 @@ function compactToolRow(theme: any, rail: string, name: string, args: any, statu
 
 const resultSummaryCache = new WeakMap<object, string>();
 function resultSummary(tool: any): string {
-	if (tool._groupInterrupted) return "已中断";
+	if (tool._groupInterrupted && (!tool.result || tool.isPartial === true)) return "已中断";
 	const result = tool.result;
 	if (!result || toolStatus(tool) === "pending") return "";
 	const cached = resultSummaryCache.get(result);
@@ -644,14 +640,10 @@ export class CompactExternalGroupComponent implements Component {
 
 	private renderCollapsed(width: number): string[] {
 		const status = (tool: CompactExternalTool) => tool.status;
-		const working = this.state.tools.some((tool) => tool.status === "pending") || (!this.state.sealed && (this.state.thinkingActive || !this.state.tools.length));
-		const thinking = this.state.thinking;
-		const keepThinking = !!thinking.trim() && (config.collapsedMaxLines > 2 || !this.state.tools.length);
-		const lines = [groupHeading(this.theme, this.state.tools, status, false, working, !!thinking.trim(), this.tokenLabel(), width)];
-		const shown = selectedTools(this.state.tools, Math.max(1, config.collapsedMaxLines - 1 - (keepThinking ? 1 : 0)), status);
-		const column = nameColumn(shown, width, (tool) => tool.name);
-		shown.forEach((tool, index) => lines.push(this.toolRow(index === shown.length - 1 && !keepThinking ? "╰  " : "│  ", tool, width, column)));
-		if (keepThinking) lines.push(thinkingPreview(this.theme, thinking, width));
+		const pending = latestPending(this.state.tools, status);
+		const working = !!pending || (!this.state.sealed && (this.state.thinkingActive || !this.state.tools.length));
+		const lines = [groupHeading(this.theme, this.state.tools, status, false, working, !!this.state.thinking.trim(), this.tokenLabel(), width)];
+		if (pending) lines.push(this.toolRow("╰  ", pending, width, nameColumn([pending], width, (tool) => tool.name)));
 		return lines;
 	}
 
@@ -991,16 +983,12 @@ class ToolGroupComponent extends Container {
 		return this === lastActiveGroup && !this.sealed && thinkingActive;
 	}
 
-	// Folded: header + up to collapsedMaxLines total, ellipsis when exceeding.
+	// 已完成的过程退为单行；收起时不显示思考原文，只有运行中的调用保留一行进度。
 	private renderCollapsed(width: number): string[] {
-		const thinking = this.liveThinking();
-		const keepThinking = thinking.trim().length > 0 && (config.collapsedMaxLines > 2 || this.children.length === 0);
-		const working = this.hasPending() || this.liveThinkingActive() || (!this.sealed && this.children.length === 0);
-		const lines = [groupHeading(currentTheme, this.children, toolStatus, false, working, !!thinking.trim(), this.liveThinkingTokenLabel(), width)];
-		const shown = selectedTools(this.children, Math.max(1, config.collapsedMaxLines - 1 - (keepThinking ? 1 : 0)), toolStatus);
-		const column = nameColumn(shown, width, (tool) => tool.toolName);
-		shown.forEach((tool, index) => lines.push(this.toolRow(index === shown.length - 1 && !keepThinking ? "╰  " : "│  ", tool, width, column)));
-		if (keepThinking) lines.push(thinkingPreview(currentTheme, thinking, width));
+		const pending = latestPending(this.children, toolStatus);
+		const working = !!pending || this.liveThinkingActive() || (!this.sealed && this.children.length === 0);
+		const lines = [groupHeading(currentTheme, this.children, toolStatus, false, working, !!this.liveThinking().trim(), this.liveThinkingTokenLabel(), width)];
+		if (pending) lines.push(this.toolRow("╰  ", pending, width, nameColumn([pending], width, (tool) => tool.toolName)));
 		if (working) scheduleAnimation();
 		return lines;
 	}
@@ -1904,7 +1892,7 @@ export default function (pi: ExtensionAPI) {
 			// Non-TUI modes (print/json) can't show the interactive menu.
 			if (ctx.mode !== "tui") {
 				ctx.ui.notify(
-					`compact: collapsedMaxLines=${config.collapsedMaxLines}, expandedThinkingLines=${config.expandedThinkingLines}, nativeTools=${config.nativeTools.join(",")} (${CONFIG_PATH})`,
+					`compact: expandedThinkingLines=${config.expandedThinkingLines}, nativeTools=${config.nativeTools.join(",")} (${CONFIG_PATH})`,
 					"info",
 				);
 				return;

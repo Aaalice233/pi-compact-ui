@@ -47,7 +47,8 @@ test("纯思考与工具调用前的思考有展开入口，历史组静态缓�
 		[thinking("历史推理\n第二行详情"), { type: "toolCall", id: "read-1", name: "read", arguments: {} }],
 	]) {
 		const component = history(msg(content, { usage: { reasoning: 200 } }));
-		assert.match(plain(component), /历史推理/);
+		assert.match(plain(component), /思考记录/);
+		assert.doesNotMatch(plain(component), /历史推理|第二行详情/);
 		component.setExpanded(true);
 		assert.match(plain(component), /第二行详情/);
 		const [group] = nestedGroups(component);
@@ -72,7 +73,12 @@ test("多段思考不重复分配消息总 token；空思考不生成空组", ()
 test("截断或中断消息先展示历史思考，再保留原生诊断", () => {
 	for (const [stopReason, diagnostic] of [["aborted", "Operation aborted"], ["length", "Response was truncated"]]) {
 		const component = history(msg([thinking("中断前思考")], { stopReason }));
+		assert.doesNotMatch(plain(component), /中断前思考/);
+		assert.match(plain(component), /思考记录/);
+		assert.match(plain(component), new RegExp(diagnostic));
+		component.setExpanded(true);
 		const output = plain(component);
+		assert.ok(output.indexOf("中断前思考") >= 0);
 		assert.ok(output.indexOf("中断前思考") < output.indexOf(diagnostic));
 		assert.match(output, new RegExp(diagnostic));
 	}
@@ -85,6 +91,8 @@ test("重新选择分支或压缩后重建只显示传入消息，不从旧组�
 	chat.clear();
 	const current = history(msg([thinking("新分支"), text("新正文")]));
 	chat.addChild(current);
+	assert.doesNotMatch(plain(chat), /新分支/);
+	current.setExpanded(true);
 	assert.match(plain(chat), /新分支/);
 	assert.doesNotMatch(plain(chat), /旧分支/);
 	chat.clear();
@@ -117,6 +125,8 @@ test("实时流式组件在最终帧和 invalidate 后不额外复制历史思�
 	component.updateContent(source, false);
 	await fake.emit("agent_end");
 	component.invalidate();
+	assert.doesNotMatch(plain(chat), /实时推理/);
+	for (const child of chat.children as any[]) child.setExpanded?.(true);
 	const output = plain(chat);
 	assert.equal(output.split("实时推理").length - 1, 1);
 	assert.equal(nestedGroups(component).length, 0);
@@ -149,6 +159,8 @@ test("实时思考锚定正文后重复终帧重建仍只有一个组", async ()
 test("/reload 重建窗口中的历史思考在下一实例安装后仍可重画", async () => {
 	await fake.emit("session_shutdown", { reason: "reload" });
 	const component = history(msg([thinking("重载保留"), text("回复")]));
+	assert.doesNotMatch(plain(component), /重载保留/);
+	component.setExpanded(true);
 	assert.match(plain(component), /重载保留/);
 	const next = createFakePi();
 	const fresh = await import(`../index.ts?reload=${Date.now()}`);

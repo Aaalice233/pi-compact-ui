@@ -22,15 +22,66 @@ function fixture(): CompactExternalGroup {
 	};
 }
 
-test("折叠严格三行，失败项不被较新的成功项掩盖", () => {
+test("已完成组收起为单行，保留失败数量但隐藏工具与思考原文", () => {
 	const component = new CompactExternalGroupComponent(fixture(), plainTheme);
 	const lines = component.render(80).map(stripTerminalSequences);
-	assert.equal(lines.length, 3);
+	assert.equal(lines.length, 1);
 	assert.match(lines[0]!, /read ×1 · bash ×1 · mcp ×1 · 1 失败/);
 	assert.match(lines[0]!, /思考 1.2K/);
-	assert.match(lines[1]!, /✗ bash.*断言失败/);
-	assert.match(lines[2]!, /╰.*验证过期/);
+	assert.doesNotMatch(lines.join("\n"), /断言失败|验证过期|认证\.ts/);
+	component.setExpanded(true);
+	assert.match(component.render(80).join("\n"), /✗ bash.*断言失败/);
 	assert.doesNotMatch(lines.join("\n"), /tools done|tool calling|thinking:/);
+});
+
+test("外部组只显示最新待完成调用，结束后自动退为标题", () => {
+	const data = fixture();
+	data.sealed = false;
+	data.thinkingActive = true;
+	data.tools[0]!.status = "pending";
+	data.tools[2]!.status = "pending";
+	const group = new CompactExternalGroupComponent(data, plainTheme);
+	assert.equal(group.render(120).length, 2);
+	assert.match(group.render(120)[1]!, /mcp.*inspect_actor/);
+	assert.doesNotMatch(group.render(120).join("\n"), /验证过期|断言失败/);
+	data.tools[2]!.status = "success";
+	assert.match(group.render(120)[1]!, /read.*认证/);
+	data.tools[0]!.status = "success";
+	assert.equal(group.render(120).length, 1, "没有待完成工具时，思考中也不显示原文");
+	data.thinkingActive = false; data.sealed = true;
+	assert.equal(group.render(120).length, 1);
+	assert.match(group.render(120)[0]!, /1 失败/);
+});
+
+test("纯思考默认只显示入口和用量，点击后仍可查看原文", () => {
+	const data = fixture(); data.tools = [];
+	const group = new CompactExternalGroupComponent(data, plainTheme);
+	assert.deepEqual(group.render(120), [" ▸ 思考记录 · 思考 1.2K"]);
+	group.setExpanded(true);
+	assert.match(group.render(120).join("\n"), /验证过期/);
+});
+
+test("主会话完成后折为单行，运行时不被历史失败占住进度行", async () => {
+	await fake.emit("agent_start");
+	const chat = new Container();
+	chat.addChild(new AssistantMessageComponent({ role: "assistant", content: [] } as any));
+	const tools = ["old", "running-a", "running-b"].map((id) => {
+		const tool = new ToolExecutionComponent("read", id, { path: `${id}.ts` }, {}, { name: "read" } as any, { requestRender() {} } as any, process.cwd());
+		chat.addChild(tool); return tool;
+	});
+	const finish = (index: number, isError = false) => tools[index]!.updateResult({ content: [{ type: "text", text: "工具返回原文" }], details: undefined, isError }, false);
+	finish(0, true);
+	const group = chat.children.find((child: any) => child.toolName === "group") as any;
+	const lines = () => group.render(120).filter((line: string) => line.trim());
+	assert.equal(lines().length, 2);
+	assert.match(lines()[1], /running-b\.ts/);
+	finish(2);
+	assert.match(lines()[1], /running-a\.ts/);
+	finish(1);
+	assert.equal(lines().length, 1);
+	assert.match(lines()[0], /read ×3 · 1 失败/);
+	assert.doesNotMatch(lines()[0], /工具返回原文/);
+	await fake.emit("agent_end"); chat.clear();
 });
 
 test("中文、emoji、长工具名在极窄到宽屏都不溢出；耗时紧跟内容", () => {
@@ -57,19 +108,22 @@ test("宽终端的标题 token 和工具耗时就近显示，不填充整行", (
 	];
 	state.thinking = "";
 	const component = new CompactExternalGroupComponent(state, plainTheme);
+	assert.deepEqual(component.render(240), [" ▸ bash ×2"]);
+	component.setExpanded(true);
 	assert.deepEqual(component.render(240), [
-		" ▸ bash ×2",
+		" ▾ bash ×2",
 		" │  ✓ bash  pi --help 2>&1 | head -60 (9.7s)",
 		" ╰  ✓ bash  pi list 2>&1 (5.0s)",
 	]);
 	state.thinking = "检查帮助信息";
-	assert.equal(component.render(240)[0], " ▸ bash ×2 · 思考 1.2K");
+	assert.equal(component.render(240)[0], " ▾ bash ×2 · 思考 1.2K");
 	assert.equal(component.render(80)[0], component.render(240)[0]);
 });
 
 test("设置中的行数按整数和范围约束，非法值不导致超长渲染", () => {
 	const config = resolveConfig({ collapsedMaxLines: -10, expandedToolLines: 1.9, expandedThinkingLines: 1e9 });
-	assert.deepEqual([config.collapsedMaxLines, config.expandedThinkingLines], [2, 100]);
+	assert.equal(config.expandedThinkingLines, 100);
+	assert.equal("collapsedMaxLines" in config, false, "旧折叠行数设置不再使用");
 	assert.equal("expandedToolLines" in config, false, "旧返回正文预览设置不再使用");
 });
 
@@ -87,8 +141,11 @@ test("主会话与外部视图保持失败语义，静态缓存不再执行渲�
 	const lines = group.render(80);
 	assert.equal(group.render(80), lines);
 	assert.match(lines.join("\n"), /1 失败/);
-	assert.match(lines.join("\n"), /失败诊断/);
-	assert.doesNotMatch(lines.join("\n"), /0\.0s/);
+	assert.doesNotMatch(lines.join("\n"), /失败诊断/);
+	assert.equal(lines.filter((line) => line.trim()).length, 1);
+	(group as any).setExpanded(true);
+	assert.match(group.render(80).join("\n"), /失败诊断/);
+	assert.doesNotMatch(group.render(80).join("\n"), /0\.0s/);
 	chat.clear();
 });
 
