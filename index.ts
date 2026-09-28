@@ -7,7 +7,7 @@
  * merged into the same block.
  *
  * Completed groups collapse to one header; running groups show at most one pending tool.
- *   ▸ bash ×1 · edit ×2 · read ×1 · 思考 1.2K
+ *   ▸ bash×1 edit×2 read×1 · 思考 1.2K
  *
  * Fullscreen header clicks toggle one group; Ctrl+O sets expansion globally via setExpanded.
  * Thinking preview line counts are configurable via /compact-ui-config (interactive
@@ -350,9 +350,11 @@ function groupHeading(theme: any, tools: any[], status: (tool: any) => ToolStatu
 		counts.set(name, (counts.get(name) ?? 0) + 1);
 	}
 	const label = tools.length
-		? [...counts].map(([name, count]) => `${oneLine(name, 24)} ×${count}`).join(" · ")
+		? [...counts].map(([name, count]) => `${oneLine(name, 24)}×${count}`).join(" ")
 		: working ? "正在思考" : "思考记录";
-	const detail = (failed ? fg("error", ` · ${failed} 失败`) : "") + (pending ? fg("accent", ` · ${pending} 运行中`) : "");
+	const separator = fg("dim", " · ");
+	const detail = (failed ? `${separator}${fg("error", `失败${failed}`)}` : "") +
+		(pending ? `${separator}${fg("accent", `运行中${pending}`)}` : "");
 	const icon = fg("muted", expanded ? "▾" : "▸") + (working ? ` ${fg("accent", frame)}` : "");
 	let added = 0;
 	let removed = 0;
@@ -366,7 +368,7 @@ function groupHeading(theme: any, tools: any[], status: (tool: any) => ToolStatu
 		added += Number(diff[1]);
 		removed += Number(diff[2]);
 	}
-	const changes = hasDiff ? ` ${fg("toolDiffAdded", `+${added}`)} ${fg("toolDiffRemoved", `−${removed}`)}` : "";
+	const changes = hasDiff ? `${separator}${fg("toolDiffAdded", `+${added}`)} ${fg("toolDiffRemoved", `−${removed}`)}` : "";
 	const available = Math.max(1, width - GROUP_PADDING_X);
 	const usage = thinking ? fg("dim", ` · 思考 ${tokens}`) : "";
 	// 窄屏先省略 token，再裁剪工具摘要，保留编辑增减与失败/运行状态。

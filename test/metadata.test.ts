@@ -35,7 +35,7 @@ test("增减分别使用主题红绿，耗时加括号且紧邻内容", async ()
 			assert.match(output, /\x1b\[31m−2\x1b\[39m/);
 			if (expanded) assert.match(stripTerminalSequences(output), /src\/auth\.ts \+1 −2 \(\d+\.\ds\)/);
 			else {
-				assert.match(stripTerminalSequences(output), /▸ edit ×1 \+1 −2/);
+				assert.match(stripTerminalSequences(output), /▸ edit×1 · \+1 −2/);
 				assert.doesNotMatch(stripTerminalSequences(output), /src\/auth\.ts/);
 			}
 			assert.equal(group.render(80), group.render(80), "静态渲染继续使用缓存");
@@ -68,7 +68,7 @@ test("折叠标题累计多个成功编辑，排除失败、进行中和未知 d
 	const group = chat.children.find((child: any) => child.toolName === "group") as any;
 	try {
 		const heading = group.render(160).map(stripTerminalSequences).find((line: string) => line.trim())!;
-		assert.match(heading, /edit ×5 \+19 −43 · 1 失败 · 1 运行中/);
+		assert.match(heading, /edit×5 · \+19 −43 · 失败1 · 运行中1/);
 		assert.doesNotMatch(heading, /[+−](99|118|142|217|241)/);
 		await fake.emit("agent_end");
 		assert.equal(group.needsAnimation(), false, "运行结束后，部分结果也应标为中断并停止动画");
@@ -88,7 +88,7 @@ test("没有实际 diff 的成功编辑不显示伪造的零增减", async () =>
 	tool.updateResult({ content: [{ type: "text", text: "修改成功" }], details: undefined, isError: false }, false);
 	await fake.emit("agent_end");
 	const group = chat.children.find((child: any) => child.toolName === "group") as any;
-	assert.equal(group.render(120).map(stripTerminalSequences).filter((line: string) => line.trim()).join(""), " ▸ edit ×1");
+	assert.equal(group.render(120).map(stripTerminalSequences).filter((line: string) => line.trim()).join(""), " ▸ edit×1");
 	chat.clear();
 });
 

@@ -166,7 +166,7 @@ describe("交互模式", () => {
 		assert.equal(group.needsAnimation(), true);
 		await fake.emit("agent_end");
 		assert.equal(group.needsAnimation(), false);
-		assert.match(group.render(80).join("\n"), /bash ×1 · 1 失败/);
+		assert.match(group.render(80).join("\n"), /bash×1 · 失败1/);
 		group.setExpanded(true);
 		assert.match(group.render(80).join("\n"), /✗ bash.*已中断/);
 	});

@@ -26,7 +26,7 @@ test("已完成组收起为单行，保留失败数量但隐藏工具与思考�
 	const component = new CompactExternalGroupComponent(fixture(), plainTheme);
 	const lines = component.render(80).map(stripTerminalSequences);
 	assert.equal(lines.length, 1);
-	assert.match(lines[0]!, /read ×1 · bash ×1 · mcp ×1 · 1 失败/);
+	assert.match(lines[0]!, /read×1 bash×1 mcp×1 · 失败1/);
 	assert.match(lines[0]!, /思考 1.2K/);
 	assert.doesNotMatch(lines.join("\n"), /断言失败|验证过期|认证\.ts/);
 	component.setExpanded(true);
@@ -50,7 +50,7 @@ test("外部组只显示最新待完成调用，结束后自动退为标题", ()
 	assert.equal(group.render(120).length, 1, "没有待完成工具时，思考中也不显示原文");
 	data.thinkingActive = false; data.sealed = true;
 	assert.equal(group.render(120).length, 1);
-	assert.match(group.render(120)[0]!, /1 失败/);
+	assert.match(group.render(120)[0]!, /失败1/);
 });
 
 test("纯思考默认只显示入口和用量，点击后仍可查看原文", () => {
@@ -79,7 +79,7 @@ test("主会话完成后折为单行，运行时不被历史失败占住进度�
 	assert.match(lines()[1], /running-a\.ts/);
 	finish(1);
 	assert.equal(lines().length, 1);
-	assert.match(lines()[0], /read ×3 · 1 失败/);
+	assert.match(lines()[0], /read×3 · 失败1/);
 	assert.doesNotMatch(lines()[0], /工具返回原文/);
 	await fake.emit("agent_end"); chat.clear();
 });
@@ -108,15 +108,15 @@ test("宽终端的标题 token 和工具耗时就近显示，不填充整行", (
 	];
 	state.thinking = "";
 	const component = new CompactExternalGroupComponent(state, plainTheme);
-	assert.deepEqual(component.render(240), [" ▸ bash ×2"]);
+	assert.deepEqual(component.render(240), [" ▸ bash×2"]);
 	component.setExpanded(true);
 	assert.deepEqual(component.render(240), [
-		" ▾ bash ×2",
+		" ▾ bash×2",
 		" │  ✓ bash  pi --help 2>&1 | head -60 (9.7s)",
 		" ╰  ✓ bash  pi list 2>&1 (5.0s)",
 	]);
 	state.thinking = "检查帮助信息";
-	assert.equal(component.render(240)[0], " ▾ bash ×2 · 思考 1.2K");
+	assert.equal(component.render(240)[0], " ▾ bash×2 · 思考 1.2K");
 	assert.equal(component.render(80)[0], component.render(240)[0]);
 });
 
@@ -140,7 +140,7 @@ test("主会话与外部视图保持失败语义，静态缓存不再执行渲�
 	const group = chat.children.find((child) => (child as any).toolName === "group")!;
 	const lines = group.render(80);
 	assert.equal(group.render(80), lines);
-	assert.match(lines.join("\n"), /1 失败/);
+	assert.match(lines.join("\n"), /失败1/);
 	assert.doesNotMatch(lines.join("\n"), /失败诊断/);
 	assert.equal(lines.filter((line) => line.trim()).length, 1);
 	(group as any).setExpanded(true);
@@ -174,6 +174,28 @@ test("一级展开显示完整平铺列表，不解析返回正文或混排多�
 		assert.match(lines.at(-1)!, /╰.*思考摘要/);
 		assert.equal(group.render(120), group.render(120));
 	} finally { Markdown.prototype.render = original; chat.clear(); }
+});
+
+test("长工具摘要只在信息类别之间使用分隔点，失败数量保持真实", async () => {
+	await fake.emit("agent_start");
+	const chat = new Container();
+	chat.addChild(new AssistantMessageComponent({ role: "assistant", content: [] } as any));
+	for (const [name, count] of [["mcpScript", 14], ["mcp", 13], ["grep", 3], ["find", 3], ["read", 7], ["write", 3], ["edit", 3], ["bash", 8]] as const) {
+		for (let i = 0; i < count; i++) {
+			const tool = new ToolExecutionComponent(name, `${name}-${i}`, {}, {}, { name } as any, { requestRender() {} } as any, process.cwd());
+			chat.addChild(tool);
+			const diff = name === "edit" && i < 2 ? (i === 0 ? "+new\n".repeat(8) : "-old\n".repeat(3)) : undefined;
+			tool.updateResult({ content: [{ type: "text", text: "结果" }], details: diff ? { diff } : undefined, isError: name === "bash" && i < 2 }, false);
+		}
+	}
+	await fake.emit("agent_end");
+	const group = chat.children.find((child: any) => child.toolName === "group") as any;
+	try {
+		const heading = group.render(240).map(stripTerminalSequences).filter((line: string) => line.trim());
+		assert.deepEqual(heading, [" ▸ mcpScript×14 mcp×13 grep×3 find×3 read×7 write×3 edit×3 bash×8 · +8 −3 · 失败2"]);
+		group.setExpanded(true);
+		assert.equal(stripTerminalSequences(group.render(240)[1]), heading[0].replace("▸", "▾"));
+	} finally { chat.clear(); }
 });
 
 test("主题失效后颜色重新计算，静态内容保持一致", () => {

@@ -27,12 +27,12 @@ function state(): CompactExternalGroup {
 test("摘要统计全部调用，按首次出现顺序排列，保留失败和运行状态", () => {
 	const data = state();
 	const group = new CompactExternalGroupComponent(data, plainTheme);
-	assert.match(plain(group)[0]!, /bash ×1 · edit ×2 · read ×1 · 1 失败 · 1 运行中/);
-	assert.match(plain(group, 36)[0]!, /1 失败 · 1 运行中$/, "窄屏优先保留完整状态");
+	assert.match(plain(group)[0]!, /bash×1 edit×2 read×1 · 失败1 · 运行中1/);
+	assert.match(plain(group, 36)[0]!, /失败1 · 运行中1$/, "窄屏优先保留完整状态");
 	data.tools.push({ ...data.tools[0]!, id: "5" });
-	assert.match(plain(group)[0]!, /bash ×2 · edit ×2 · read ×1/);
+	assert.match(plain(group)[0]!, /bash×2 edit×2 read×1/);
 	group.setExpanded(true);
-	assert.match(plain(group)[0]!, /▾.*bash ×2 · edit ×2 · read ×1/);
+	assert.match(plain(group)[0]!, /▾.*bash×2 edit×2 read×1/);
 });
 
 test("外部组单击标题切换，空白/正文/拖选/滚轮/修饰键不抢占", () => {
@@ -78,7 +78,7 @@ test("真实 Container 路由标题点击，只展开该组且不调用隐藏工
 	const groups = chat.children.filter((child: any) => child.toolName === "group") as any[];
 	assert.equal(groups.length, 2);
 	const lines = plain(chat);
-	const row = lines.findIndex((line) => /▸ read ×1/.test(line));
+	const row = lines.findIndex((line) => /▸ read×1/.test(line));
 	assert.ok(row >= 1);
 	const beforeRenders = renders;
 	assert.equal(chat.handleMouse(mouse(row - 1, { height: lines.length })), undefined, "组前空行不可点击");
@@ -89,7 +89,7 @@ test("真实 Container 路由标题点击，只展开该组且不调用隐藏工
 	assert.doesNotMatch(plain(chat).join("\n"), /a详细输出/);
 	assert.equal(renders, beforeRenders, "点击不应走隐藏工具的原生渲染/鼠标布局");
 	groups[0].setExpanded(false);
-	assert.match(plain(chat)[row]!, /▸ read ×1/);
+	assert.match(plain(chat)[row]!, /▸ read×1/);
 	chat.clear();
 });
 

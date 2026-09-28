@@ -37,7 +37,7 @@ for (const mode of ["print", "json", "rpc"]) {
 	test(`同进程 ${mode} 子会话结束不应把主会话工具标为失败`, async () => {
 		const h = await setup(mode);
 		try {
-			assert.match(plain(h.group), /1 运行中/);
+			assert.match(plain(h.group), /运行中1/);
 			await h.child.emit("agent_end", {}, mode);
 			assert.equal(h.tool._groupInterrupted, undefined, "子会话不能中断父会话的工具");
 			assert.equal(h.group.sealed, false, "子会话不能封存父会话的组");
@@ -48,7 +48,7 @@ for (const mode of ["print", "json", "rpc"]) {
 			await h.parent.emit("agent_end");
 			assert.equal(h.tool._groupInterrupted, true);
 			assert.equal(h.group.needsAnimation(), false);
-			assert.match(plain(h.group), /1 失败/);
+			assert.match(plain(h.group), /失败1/);
 		} finally { await h.cleanup(); }
 	});
 
@@ -145,6 +145,6 @@ test("已关闭的旧 TUI 实例不能用迟到事件中断新实例", async () 
 		await stale.emit("agent_end");
 		assert.equal(h.tool._groupInterrupted, undefined);
 		assert.equal(h.group.sealed, false);
-		assert.match(plain(h.group), /1 运行中/);
+		assert.match(plain(h.group), /运行中1/);
 	} finally { await h.cleanup(); }
 });
