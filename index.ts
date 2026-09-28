@@ -211,6 +211,8 @@ const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", 
 // 100ms/frame (10fps) matches pi's default spinner cadence; 300ms felt laggy.
 const SPINNER_MS = 100;
 const GROUP_PADDING_X = 1;
+/** 低于这个宽度就不显示耗时列：正文比“用了多久”重要。 */
+const MIN_TIMED_ROW_WIDTH = 36;
 const spinnerStart = Date.now();
 const PARENT_KEY = Symbol.for("compact-ui.group-parent");
 const PATCH_KEY = Symbol.for("compact-ui.group-patch");
@@ -321,27 +323,25 @@ function toolStatus(tool: any): ToolStatus {
 	return tool?.result ? "success" : "pending";
 }
 
+/** 不足 0.1s 的调用不报耗时：四舍五入到 0.0s 的数字没有信息量，不值得占一列。 */
+function formatElapsed(ms: number): string {
+	const rounded = (Math.max(0, ms) / 1000).toFixed(1);
+	return rounded === "0.0" ? "" : `${rounded}s`;
+}
+
 function toolElapsed(tool: any): string {
 	const start = toolStarts.get(tool.toolCallId);
 	// 历史结果没有执行计时，不能用加载时间伪造 0.0s。
 	if (start === undefined) return "";
 	if ((tool?.result || tool?._groupInterrupted) && tool._groupEndAt === undefined) return "";
 	const end = tool._groupEndAt ?? Date.now();
-	return `${(Math.max(0, end - start) / 1000).toFixed(1)}s`;
-}
-
-// 元数据紧跟关联内容，不随终端变宽被推到远端；窄屏仍优先保留工具与错误正文。
-function appendMetadata(content: string, metadata: string, width: number): string {
-	const available = Math.max(1, width);
-	if (!metadata || available < 36) return truncateToWidth(content, available, "…");
-	return truncateToWidth(content, Math.max(1, available - visibleWidth(metadata)), "…") + metadata;
+	return formatElapsed(end - start);
 }
 
 function groupHeading(theme: any, tools: any[], status: (tool: any) => ToolStatus, expanded: boolean,
-	working: boolean, thinking: boolean, tokens: string, width: number): string {
+	working: boolean, width: number): string {
 	const fg = (color: string, value: string) => theme?.fg?.(color, value) ?? value;
 	const failed = tools.filter((tool) => status(tool) === "error").length;
-	const pending = tools.filter((tool) => status(tool) === "pending").length;
 	const frame = SPINNER[Math.floor((Date.now() - spinnerStart) / SPINNER_MS) % SPINNER.length]!;
 	// 按首次调用顺序汇总，流式追加同类调用只改数量，不让工具名来回换位置。
 	const counts = new Map<string, number>();
@@ -353,8 +353,8 @@ function groupHeading(theme: any, tools: any[], status: (tool: any) => ToolStatu
 		? [...counts].map(([name, count]) => `${oneLine(name, 24)}×${count}`).join(" ")
 		: working ? "正在思考" : "思考记录";
 	const separator = fg("dim", " · ");
-	const detail = (failed ? `${separator}${fg("error", `失败${failed}`)}` : "") +
-		(pending ? `${separator}${fg("accent", `运行中${pending}`)}` : "");
+	// 运行中的调用由下面的进度行交代，标题不再重复计数。
+	const detail = failed ? `${separator}${fg("muted", `失败${failed}`)}` : "";
 	const icon = fg("muted", expanded ? "▾" : "▸") + (working ? ` ${fg("accent", frame)}` : "");
 	let added = 0;
 	let removed = 0;
@@ -370,9 +370,8 @@ function groupHeading(theme: any, tools: any[], status: (tool: any) => ToolStatu
 	}
 	const changes = hasDiff ? `${separator}${fg("toolDiffAdded", `+${added}`)} ${fg("toolDiffRemoved", `−${removed}`)}` : "";
 	const available = Math.max(1, width - GROUP_PADDING_X);
-	const usage = thinking ? fg("dim", ` · 思考 ${tokens}`) : "";
-	// 窄屏先省略 token，再裁剪工具摘要，保留编辑增减与失败/运行状态。
-	const suffix = changes + detail + (visibleWidth(`${icon} ${label}${changes}${detail}${usage}`) <= available ? usage : "");
+	// 思考用量不占标题：运行中由进度行交代状态，结束后也没有需要盯着看的数字。
+	const suffix = changes + detail;
 	const title = truncateToWidth(label, Math.max(1, available - visibleWidth(`${icon} ${suffix}`)), "…");
 	return truncateToWidth(`${icon} ${fg(working ? "accent" : "muted", title)}${suffix}`, available, "…");
 }
@@ -401,8 +400,9 @@ function latestPending<T>(tools: T[], status: (tool: T) => ToolStatus): T | unde
 	return undefined;
 }
 
-function compactToolRow(theme: any, rail: string, name: string, args: any, status: ToolStatus,
-	elapsed: string, detail: string, width: number, nameWidth: number): string {
+/** 行主体（不含耗时）：耗时单独成列，所以内容与时间必须分开组装。 */
+function toolRowContent(theme: any, rail: string, name: string, args: any, status: ToolStatus,
+	detail: string, width: number, nameWidth: number): string {
 	const fg = (color: string, value: string) => theme?.fg?.(color, value) ?? value;
 	const summary = toolSummary(name, args);
 	const title = truncateToWidth(oneLine(summary.name, nameWidth), nameWidth, "…");
@@ -418,8 +418,21 @@ function compactToolRow(theme: any, rail: string, name: string, args: any, statu
 	const detailText = status === "error" ? "" : diff
 		? `${fg("toolDiffAdded", `+${diff[1]}`)} ${fg("toolDiffRemoved", `−${diff[2]}`)}`
 		: detail ? fg("dim", detail) : "";
-	const metadata = [detailText, elapsed ? fg("dim", `(${elapsed})`) : ""].filter(Boolean).join(" ");
-	return appendMetadata(left, metadata ? ` ${metadata}` : "", width - GROUP_PADDING_X);
+	return detailText ? `${left} ${detailText}` : left;
+}
+
+/** 耗时列紧跟本组最宽的一行，不贴到终端最右；窄屏宁可不要耗时也要保住正文。 */
+function timeColumnFor(contents: string[], timeWidth: number, available: number): number {
+	const widest = contents.reduce((max, content) => Math.max(max, visibleWidth(content)), 0);
+	return Math.max(1, Math.min(widest + 1, available - timeWidth - 1));
+}
+
+function joinToolRow(theme: any, content: string, elapsed: string, available: number, column: number): string {
+	if (!elapsed || available < MIN_TIMED_ROW_WIDTH) return truncateToWidth(content, available, "…");
+	const timeWidth = visibleWidth(elapsed);
+	const width = Math.max(1, Math.min(column, available - timeWidth - 1));
+	const body = truncateToWidth(content, width, "…");
+	return `${body}${" ".repeat(Math.max(1, width - visibleWidth(body)))}${theme?.fg?.("dim", elapsed) ?? elapsed}`;
 }
 
 const resultSummaryCache = new WeakMap<object, string>();
@@ -607,12 +620,24 @@ export class CompactExternalGroupComponent implements Component {
 
 	private elapsed(tool: CompactExternalTool): string {
 		const end = tool.endedAt ?? Date.now();
-		return `${Math.max(0, (end - tool.startedAt) / 1000).toFixed(1)}s`;
+		return formatElapsed(end - tool.startedAt);
 	}
 
-	private toolRow(rail: string, tool: CompactExternalTool, width: number, column: number): string {
-		return compactToolRow(this.theme, rail, tool.name, tool.args, tool.status, this.elapsed(tool),
-			tool.status === "error" ? oneLine(tool.resultText.slice(0, 4096).split("\n").find((line) => line.trim()), 100) || "执行失败" : "", width, column);
+	private detail(tool: CompactExternalTool): string {
+		if (tool.status !== "error") return "";
+		return oneLine(tool.resultText.slice(0, 4096).split("\n").find((line) => line.trim()), 100) || "执行失败";
+	}
+
+	/** 行主体先全部算完再统一取耗时列，组内时间才能对齐到同一列。 */
+	private toolLines(rows: Array<{ rail: string; tool: CompactExternalTool }>, width: number): string[] {
+		const available = Math.max(1, width - GROUP_PADDING_X);
+		const column = nameColumn(rows.map((row) => row.tool), width, (tool) => tool.name);
+		const contents = rows.map((row) =>
+			toolRowContent(this.theme, row.rail, row.tool.name, row.tool.args, row.tool.status, this.detail(row.tool), width, column));
+		const elapsed = rows.map((row) => this.elapsed(row.tool));
+		const timeWidth = elapsed.reduce((max, value) => Math.max(max, visibleWidth(value)), 0);
+		const timeColumn = timeColumnFor(contents, timeWidth, available);
+		return contents.map((content, index) => joinToolRow(this.theme, content, elapsed[index]!, available, timeColumn));
 	}
 
 	private tokenLabel(): string {
@@ -644,8 +669,8 @@ export class CompactExternalGroupComponent implements Component {
 		const status = (tool: CompactExternalTool) => tool.status;
 		const pending = latestPending(this.state.tools, status);
 		const working = !!pending || (!this.state.sealed && (this.state.thinkingActive || !this.state.tools.length));
-		const lines = [groupHeading(this.theme, this.state.tools, status, false, working, !!this.state.thinking.trim(), this.tokenLabel(), width)];
-		if (pending) lines.push(this.toolRow("╰  ", pending, width, nameColumn([pending], width, (tool) => tool.name)));
+		const lines = [groupHeading(this.theme, this.state.tools, status, false, working, width)];
+		if (pending) lines.push(...this.toolLines([{ rail: "╰  ", tool: pending }], width));
 		return lines;
 	}
 
@@ -653,13 +678,9 @@ export class CompactExternalGroupComponent implements Component {
 		const fg = (color: string, text: string) => this.theme?.fg?.(color, text) ?? text;
 		const working = this.state.tools.some((tool) => tool.status === "pending") || (!this.state.sealed && (this.state.thinkingActive || !this.state.tools.length));
 		const hasThinking = !!this.state.thinking.trim();
-		const lines = [groupHeading(this.theme, this.state.tools, (tool) => tool.status, true, working, hasThinking, this.tokenLabel(), width)];
-		const column = nameColumn(this.state.tools, width, (tool) => tool.name);
-		for (let index = 0; index < this.state.tools.length; index++) {
-			const tool = this.state.tools[index]!;
-			const last = index === this.state.tools.length - 1 && !hasThinking;
-			lines.push(this.toolRow(last ? "╰  " : "│  ", tool, width, column));
-		}
+		const lines = [groupHeading(this.theme, this.state.tools, (tool) => tool.status, true, working, width)];
+		const last = this.state.tools.length - 1;
+		lines.push(...this.toolLines(this.state.tools.map((tool, index) => ({ rail: index === last && !hasThinking ? "╰  " : "│  ", tool })), width));
 		if (hasThinking && this.state.tools.length > 0) {
 			lines.push(thinkingPreview(this.theme, this.state.thinking, width));
 		} else if (hasThinking) {
@@ -855,8 +876,14 @@ class ToolGroupComponent extends Container {
 	/** Nested at a visible-text boundary rather than rendered at chat level. */
 	anchored = false;
 	private _expanded = false;
+	/** 运行中用户手动收起：本轮调用全部结束前不再自动展开。 */
+	private collapsedDuringRun = false;
 	get expanded(): boolean {
 		return this._expanded;
+	}
+	/** 本轮调用还在跑时逐行显示，调用全部结束后自己折回单行。手动展开/收起优先于它。 */
+	private autoExpanded(): boolean {
+		return this.hasPending() && !this.collapsedDuringRun;
 	}
 	/** Sealed: this block was closed by real text output — render from snapshot only. */
 	sealed = false;
@@ -881,6 +908,8 @@ class ToolGroupComponent extends Container {
 	setExpanded(expanded: boolean): void {
 		// 组内工具不再自己渲染，不转发给它们：转发会触发每个工具重跑原生渲染器，
 		// 长会话里按一次 Ctrl+O 就要重算数百个 diff/高亮。
+		// 运行中的手动收起只约束本轮：下一轮调用重新开始自动展开。
+		if (this.hasPending()) this.collapsedDuringRun = !expanded;
 		this._expanded = expanded;
 		this.markDirty();
 	}
@@ -969,8 +998,16 @@ class ToolGroupComponent extends Container {
 		return preview;
 	}
 
-	private toolRow(rail: string, tool: any, width: number, column: number): string {
-		return compactToolRow(currentTheme, rail, tool.toolName, tool.args, toolStatus(tool), toolElapsed(tool), resultSummary(tool), width, column);
+	private toolLines(rows: Array<{ rail: string; tool: any }>, width: number): string[] {
+		const available = Math.max(1, width - GROUP_PADDING_X);
+		const column = nameColumn(rows.map((row) => row.tool), width, (tool) => tool.toolName);
+		const contents = rows.map((row) =>
+			toolRowContent(currentTheme, row.rail, row.tool.toolName, row.tool.args, toolStatus(row.tool), resultSummary(row.tool), width, column));
+		// 历史工具没有原始计时，toolElapsed 返回空串，它就不会影响耗时列的列宽。
+		const elapsed = rows.map((row) => toolElapsed(row.tool));
+		const timeWidth = elapsed.reduce((max, value) => Math.max(max, visibleWidth(value)), 0);
+		const timeColumn = timeColumnFor(contents, timeWidth, available);
+		return contents.map((content, index) => joinToolRow(currentTheme, content, elapsed[index]!, available, timeColumn));
 	}
 	// Live state only applies to the not-yet-sealed (active) block.
 	private liveThinking(): string {
@@ -989,8 +1026,8 @@ class ToolGroupComponent extends Container {
 	private renderCollapsed(width: number): string[] {
 		const pending = latestPending(this.children, toolStatus);
 		const working = !!pending || this.liveThinkingActive() || (!this.sealed && this.children.length === 0);
-		const lines = [groupHeading(currentTheme, this.children, toolStatus, false, working, !!this.liveThinking().trim(), this.liveThinkingTokenLabel(), width)];
-		if (pending) lines.push(this.toolRow("╰  ", pending, width, nameColumn([pending], width, (tool) => tool.toolName)));
+		const lines = [groupHeading(currentTheme, this.children, toolStatus, false, working, width)];
+		if (pending) lines.push(...this.toolLines([{ rail: "╰  ", tool: pending }], width));
 		if (working) scheduleAnimation();
 		return lines;
 	}
@@ -1000,21 +1037,16 @@ class ToolGroupComponent extends Container {
 		const theme = currentTheme;
 		const fg = (color: string, text: string) => theme?.fg?.(color, text) ?? text;
 		const working = this.hasPending() || this.liveThinkingActive() || (!this.sealed && this.children.length === 0);
-		const hasThinking = !!this.liveThinking().trim();
-		const lines = [groupHeading(theme, this.children, toolStatus, true, working, hasThinking, this.liveThinkingTokenLabel(), width)];
-		const column = nameColumn(this.children, width, (tool) => tool.toolName);
-		const total = this.children.length;
-		for (let index = 0; index < total; index++) {
-			const tool = this.children[index];
-			const isLast = index === total - 1 && !hasThinking;
-			const rail = isLast ? "╰  " : "│  ";
-			lines.push(this.toolRow(rail, tool, width, column));
-		}
-
 		const tText = this.liveThinking().trim();
-		if (tText && total > 0) {
+		const total = this.children.length;
+		// 自动展开（本轮调用进行中）只列调用行：流式思考的 Markdown 每帧重解析，代价不值得付。
+		const hasThinking = !!tText && (this._expanded || total === 0);
+		const lines = [groupHeading(theme, this.children, toolStatus, true, working, width)];
+		lines.push(...this.toolLines(this.children.map((tool, index) => ({ rail: index === total - 1 && !hasThinking ? "╰  " : "│  ", tool })), width));
+
+		if (tText && total > 0 && hasThinking) {
 			lines.push(thinkingPreview(theme, tText, width));
-		} else if (tText) {
+		} else if (tText && hasThinking) {
 			lines.push(
 				`${fg("dim", "╰  ")}${fg("thinkingText", "思考")} ${fg("muted", `· ${this.liveThinkingTokenLabel()}`)}`,
 			);
@@ -1040,15 +1072,18 @@ class ToolGroupComponent extends Container {
 	}
 
 	render(width: number): string[] {
+		// 本轮调用结束后清除手动收起标记，下一轮调用才能重新自动展开。
+		if (this.collapsedDuringRun && !this.hasPending()) this.collapsedDuringRun = false;
 		// 转圈或实时思考中的组每帧都在变（动画帧、耗时、流式思考），不缓存；
 		// 其余状态只在下列 key 或 markDirty() 覆盖的事件中变化。
 		const animating = this.needsAnimation();
+		const expanded = this._expanded || this.autoExpanded();
 		const key = animating
 			? ""
-			: `${width}|${this._expanded ? 1 : 0}|${this.anchored ? 1 : 0}|${this.sealed ? 1 : 0}|${this === lastActiveGroup ? 1 : 0}|${this.children.length}|${this.children.map(toolStatus).join(",")}`;
+			: `${width}|${expanded ? 1 : 0}|${this.anchored ? 1 : 0}|${this.sealed ? 1 : 0}|${this === lastActiveGroup ? 1 : 0}|${this.children.length}|${this.children.map(toolStatus).join(",")}`;
 		if (!animating && this.lineCache?.key === key) return this.lineCache.lines;
 
-		const lines = this._expanded ? this.renderExpanded(width) : this.renderCollapsed(width);
+		const lines = expanded ? this.renderExpanded(width) : this.renderCollapsed(width);
 		// Indent compact blocks from the transcript edge while keeping every line
 		// within the terminal width (including mobile / narrow terminals).
 		const padding = " ".repeat(Math.min(GROUP_PADDING_X, Math.max(0, width - 1)));

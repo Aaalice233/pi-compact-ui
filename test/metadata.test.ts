@@ -7,7 +7,7 @@ import { Container, stripTerminalSequences, visibleWidth } from "@earendil-works
 import extension from "../index.ts";
 
 initTheme("dark");
-const palette: Record<string, string> = { toolDiffAdded: "\x1b[32m", toolDiffRemoved: "\x1b[31m", dim: "\x1b[90m" };
+const palette: Record<string, string> = { toolDiffAdded: "\x1b[32m", toolDiffRemoved: "\x1b[31m", dim: "\x1b[90m", muted: "\x1b[37m", error: "\x1b[35m" };
 const fake = createFakePi({ ...plainTheme, fg: (color, text) => palette[color] ? `${palette[color]}${text}\x1b[39m` : text });
 before(async () => { extension(fake.pi as any); await fake.emit("session_start"); });
 after(async () => { await fake.emit("session_shutdown"); });
@@ -25,7 +25,7 @@ async function fixture(id: string, isError = false) {
 	return { chat, group: chat.children.find((child: any) => child.toolName === "group") as any };
 }
 
-test("增减分别使用主题红绿，耗时加括号且紧邻内容", async () => {
+test("增减分别使用主题红绿，耗时右对齐成列", async () => {
 	const { chat, group } = await fixture("colors");
 	try {
 		for (const expanded of [false, true]) {
@@ -33,7 +33,7 @@ test("增减分别使用主题红绿，耗时加括号且紧邻内容", async ()
 			const output = group.render(80).join("\n");
 			assert.match(output, /\x1b\[32m\+1\x1b\[39m/);
 			assert.match(output, /\x1b\[31m−2\x1b\[39m/);
-			if (expanded) assert.match(stripTerminalSequences(output), /src\/auth\.ts \+1 −2 \(\d+\.\ds\)/);
+			if (expanded) assert.match(stripTerminalSequences(output), /src\/auth\.ts \+1 −2$/);
 			else {
 				assert.match(stripTerminalSequences(output), /▸ edit×1 · \+1 −2/);
 				assert.doesNotMatch(stripTerminalSequences(output), /src\/auth\.ts/);
@@ -47,6 +47,46 @@ test("增减分别使用主题红绿，耗时加括号且紧邻内容", async ()
 		assert.match(recolored, /\x1b\[92m\+1/);
 		assert.doesNotMatch(recolored, /\x1b\[32m\+1/);
 	} finally { palette.toolDiffAdded = "\x1b[32m"; chat.clear(); }
+});
+
+test("折叠标题的失败计数用主题灰色，红色只留给展开后的 ✗ 与错误正文", async () => {
+	const { chat, group } = await fixture("failed-color", true);
+	try {
+		assert.match(group.render(80).join("\n"), /\x1b\[37m失败1\x1b\[39m/);
+		assert.doesNotMatch(group.render(80).join("\n"), /\x1b\[35m失败/);
+	} finally { chat.clear(); }
+});
+
+test("毫秒级调用不显示 0.0s，也不占用同组的耗时列", async () => {
+	const now = Date.now;
+	try {
+		Date.now = () => 5000;
+		await fake.emit("agent_start");
+		const chat = new Container();
+		chat.addChild(new AssistantMessageComponent({ role: "assistant", content: [] } as any));
+		const build = (id: string) => {
+			const component = new ToolExecutionComponent("read", id, { path: `${id}.ts` }, {}, { name: "read" } as any, { requestRender() {} } as any, process.cwd());
+			chat.addChild(component);
+			return component;
+		};
+		await fake.emit("tool_execution_start", { toolCallId: "instant" });
+		build("instant").updateResult({ content: [{ type: "text", text: "done" }], details: undefined, isError: false } as any, false);
+		await fake.emit("tool_execution_end", { toolCallId: "instant" });
+		await fake.emit("tool_execution_start", { toolCallId: "slow" });
+		const slow = build("slow");
+		Date.now = () => 6200;
+		slow.updateResult({ content: [{ type: "text", text: "done" }], details: undefined, isError: false } as any, false);
+		await fake.emit("tool_execution_end", { toolCallId: "slow" });
+		const group = chat.children.find((child: any) => child.toolName === "group") as any;
+		group.setExpanded(true);
+		const lines = group.render(100).map(stripTerminalSequences).filter((line: string) => line.trim());
+		assert.match(lines[1]!, /instant\.ts$/, "不足 0.1s 不显示耗时");
+		assert.match(lines[2]!, /slow\.ts\s+1\.2s$/, "能计时的调用仍右对齐到同一列");
+		chat.clear();
+	} finally {
+		Date.now = now;
+		await fake.emit("agent_end");
+	}
 });
 
 test("折叠标题累计多个成功编辑，排除失败、进行中和未知 diff", async () => {
@@ -68,7 +108,7 @@ test("折叠标题累计多个成功编辑，排除失败、进行中和未知 d
 	const group = chat.children.find((child: any) => child.toolName === "group") as any;
 	try {
 		const heading = group.render(160).map(stripTerminalSequences).find((line: string) => line.trim())!;
-		assert.match(heading, /edit×5 · \+19 −43 · 失败1 · 运行中1/);
+		assert.match(heading, /edit×5 · \+19 −43 · 失败1$/);
 		assert.doesNotMatch(heading, /[+−](99|118|142|217|241)/);
 		await fake.emit("agent_end");
 		assert.equal(group.needsAnimation(), false, "运行结束后，部分结果也应标为中断并停止动画");
@@ -98,7 +138,7 @@ test("失败的 edit 不把返回的 diff 当作成功增减量", async () => {
 		assert.doesNotMatch(group.render(120).join("\n"), /[+−]\d/);
 		group.setExpanded(true);
 		const output = group.render(120).join("\n");
-		assert.match(stripTerminalSequences(output), /修改失败 \(\d+\.\ds\)/);
+		assert.match(stripTerminalSequences(output), /修改失败$/);
 		assert.doesNotMatch(output, /\x1b\[(?:32|31)m[+−]/);
 	} finally { chat.clear(); }
 });

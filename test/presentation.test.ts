@@ -27,7 +27,7 @@ test("已完成组收起为单行，保留失败数量但隐藏工具与思考�
 	const lines = component.render(80).map(stripTerminalSequences);
 	assert.equal(lines.length, 1);
 	assert.match(lines[0]!, /read×1 bash×1 mcp×1 · 失败1/);
-	assert.match(lines[0]!, /思考 1.2K/);
+	assert.doesNotMatch(lines[0]!, /思考/, "标题不再占用思考用量");
 	assert.doesNotMatch(lines.join("\n"), /断言失败|验证过期|认证\.ts/);
 	component.setExpanded(true);
 	assert.match(component.render(80).join("\n"), /✗ bash.*断言失败/);
@@ -53,15 +53,15 @@ test("外部组只显示最新待完成调用，结束后自动退为标题", ()
 	assert.match(group.render(120)[0]!, /失败1/);
 });
 
-test("纯思考默认只显示入口和用量，点击后仍可查看原文", () => {
+test("纯思考默认只显示入口，点击后仍可查看原文", () => {
 	const data = fixture(); data.tools = [];
 	const group = new CompactExternalGroupComponent(data, plainTheme);
-	assert.deepEqual(group.render(120), [" ▸ 思考记录 · 思考 1.2K"]);
+	assert.deepEqual(group.render(120), [" ▸ 思考记录"]);
 	group.setExpanded(true);
 	assert.match(group.render(120).join("\n"), /验证过期/);
 });
 
-test("主会话完成后折为单行，运行时不被历史失败占住进度行", async () => {
+test("本轮调用进行中逐行保留，调用全部结束后才折回单行", async () => {
 	await fake.emit("agent_start");
 	const chat = new Container();
 	chat.addChild(new AssistantMessageComponent({ role: "assistant", content: [] } as any));
@@ -72,19 +72,47 @@ test("主会话完成后折为单行，运行时不被历史失败占住进度�
 	const finish = (index: number, isError = false) => tools[index]!.updateResult({ content: [{ type: "text", text: "工具返回原文" }], details: undefined, isError }, false);
 	finish(0, true);
 	const group = chat.children.find((child: any) => child.toolName === "group") as any;
-	const lines = () => group.render(120).filter((line: string) => line.trim());
-	assert.equal(lines().length, 2);
-	assert.match(lines()[1], /running-b\.ts/);
+	const lines = () => group.render(120).filter((line: string) => line.trim()).map(stripTerminalSequences);
+	// 运行中自动展开：本轮的失败行与两条进行中的调用都留在屏幕上，不再“显示一下就没”。
+	assert.equal(lines().length, 4);
+	assert.match(lines()[0]!, /read×3 · 失败1$/);
+	assert.match(lines()[2]!, /running-a\.ts/);
+	assert.match(lines()[3]!, /running-b\.ts/);
 	finish(2);
-	assert.match(lines()[1], /running-a\.ts/);
+	assert.equal(lines().length, 4, "已经有结果的调用不能让同轮的其他行消失");
 	finish(1);
-	assert.equal(lines().length, 1);
-	assert.match(lines()[0], /read×3 · 失败1/);
-	assert.doesNotMatch(lines()[0], /工具返回原文/);
+	assert.equal(lines().length, 1, "本轮调用全部结束后折回单行");
+	assert.match(lines()[0]!, /read×3 · 失败1/);
+	assert.doesNotMatch(lines()[0]!, /工具返回原文/);
 	await fake.emit("agent_end"); chat.clear();
 });
 
-test("中文、emoji、长工具名在极窄到宽屏都不溢出；耗时紧跟内容", () => {
+test("运行中手动收起只约束本轮，下一轮调用重新自动展开", async () => {
+	await fake.emit("agent_start");
+	const chat = new Container();
+	chat.addChild(new AssistantMessageComponent({ role: "assistant", content: [] } as any));
+	const tool = new ToolExecutionComponent("read", "manual", { path: "manual.ts" }, {}, { name: "read" } as any, { requestRender() {} } as any, process.cwd());
+	chat.addChild(tool);
+	const group = chat.children.find((child: any) => child.toolName === "group") as any;
+	const head = () => group.render(120).filter((line: string) => line.trim())[0];
+	assert.match(head(), /▾/, "运行中默认逐行显示");
+	group.setExpanded(false);
+	assert.match(head(), /▸/, "手动收起后本轮不再自动展开");
+	assert.match(group.render(120).filter((line: string) => line.trim())[1], /manual\.ts/, "进行中的调用行仍然保留");
+	tool.updateResult({ content: [{ type: "text", text: "工具返回原文" }], details: undefined, isError: false }, false);
+	await fake.emit("tool_execution_end", { toolCallId: "manual" });
+	group.render(120);
+	// 下一轮调用开始：手动收起不再跨轮生效。
+	const next = new ToolExecutionComponent("read", "manual-2", { path: "manual-2.ts" }, {}, { name: "read" } as any, { requestRender() {} } as any, process.cwd());
+	chat.addChild(next);
+	await fake.emit("tool_execution_start", { toolCallId: "manual-2", toolName: "read", args: { path: "manual-2.ts" } });
+	const nextLines = group.render(120).filter((line: string) => line.trim());
+	assert.match(nextLines[0], /▾/);
+	assert.equal(nextLines.length, 3, "新的一轮调用重新逐行显示");
+	await fake.emit("agent_end"); chat.clear();
+});
+
+test("中文、emoji、长工具名在极窄到宽屏都不溢出；耗时成列且不贴右边缘", () => {
 	const state = fixture();
 	state.tools[0]!.name = "mcp__长工具名称😀_超长后缀";
 	const component = new CompactExternalGroupComponent(state, plainTheme);
@@ -94,13 +122,17 @@ test("中文、emoji、长工具名在极窄到宽屏都不溢出；耗时紧跟
 			assert.ok(component.render(width).every((line) => visibleWidth(line) <= width), `${width}/${expanded}`);
 		}
 	}
-	const timed = component.render(80).filter((line) => /\(\d\.\ds\)$/.test(line));
+	component.setExpanded(true);
+	const timed = component.render(80).filter((line) => /\d\.\ds$/.test(line));
 	assert.equal(timed.length, 3);
-	assert.ok(timed.every((line) => /\S \(\d\.\ds\)$/.test(line)));
-	assert.deepEqual(component.render(240).filter((line) => /\(\d\.\ds\)$/.test(line)), timed, "终端变宽不能拉开内容与耗时");
+	// 组内耗时右对齐到同一列，且由最宽的一行决定位置，不随终端宽度滑到最右。
+	const starts = timed.map((line) => visibleWidth(line.slice(0, /\d\.\ds$/.exec(line)!.index)));
+	assert.equal(new Set(starts).size, 1, "同一组里的耗时必须对齐");
+	assert.ok(starts[0]! < 76, `耗时列不能贴到终端右边缘（实际第 ${starts[0]} 列）`);
+	assert.deepEqual(component.render(240).filter((line) => /\d\.\ds$/.test(line)), timed, "终端变宽不能拉开内容与耗时");
 });
 
-test("宽终端的标题 token 和工具耗时就近显示，不填充整行", () => {
+test("宽终端的时间列紧跟最宽行，标题不再堆辅助信息", () => {
 	const state = fixture();
 	state.tools = [
 		{ id: "1", name: "bash", args: { command: "pi --help 2>&1 | head -60" }, status: "success", resultText: "", startedAt: 0, endedAt: 9700 },
@@ -112,11 +144,11 @@ test("宽终端的标题 token 和工具耗时就近显示，不填充整行", (
 	component.setExpanded(true);
 	assert.deepEqual(component.render(240), [
 		" ▾ bash×2",
-		" │  ✓ bash  pi --help 2>&1 | head -60 (9.7s)",
-		" ╰  ✓ bash  pi list 2>&1 (5.0s)",
+		" │  ✓ bash  pi --help 2>&1 | head -60 9.7s",
+		" ╰  ✓ bash  pi list 2>&1              5.0s",
 	]);
 	state.thinking = "检查帮助信息";
-	assert.equal(component.render(240)[0], " ▾ bash×2 · 思考 1.2K");
+	assert.equal(component.render(240)[0], " ▾ bash×2");
 	assert.equal(component.render(80)[0], component.render(240)[0]);
 });
 

@@ -37,7 +37,7 @@ for (const mode of ["print", "json", "rpc"]) {
 	test(`同进程 ${mode} 子会话结束不应把主会话工具标为失败`, async () => {
 		const h = await setup(mode);
 		try {
-			assert.match(plain(h.group), /运行中1/);
+			assert.match(plain(h.group), /· bash  parent-running/, "父会话的进行中调用仍然可见");
 			await h.child.emit("agent_end", {}, mode);
 			assert.equal(h.tool._groupInterrupted, undefined, "子会话不能中断父会话的工具");
 			assert.equal(h.group.sealed, false, "子会话不能封存父会话的组");
@@ -112,11 +112,11 @@ test("同名工具调用 ID 也不能让子会话覆盖主会话计时", async (
 		Date.now = () => 9000;
 		await h.child.emit("tool_execution_start", { toolCallId: "shared-call-id" }, "print");
 		Date.now = () => 10000;
-		assert.match(plain(h.group), /\(9\.0s\)/);
+		assert.match(plain(h.group), /9\.0s$/);
 		await h.child.emit("tool_execution_end", { toolCallId: "shared-call-id" }, "print");
 		assert.equal(h.tool._groupEndAt, undefined);
 		Date.now = () => 11000;
-		assert.match(plain(h.group), /\(10\.0s\)/);
+		assert.match(plain(h.group), /10\.0s$/);
 	} finally { Date.now = now; await h.cleanup(); }
 });
 
@@ -145,6 +145,6 @@ test("已关闭的旧 TUI 实例不能用迟到事件中断新实例", async () 
 		await stale.emit("agent_end");
 		assert.equal(h.tool._groupInterrupted, undefined);
 		assert.equal(h.group.sealed, false);
-		assert.match(plain(h.group), /运行中1/);
+		assert.match(plain(h.group), /· bash  parent-running/, "新实例的进行中调用不受旧实例事件影响");
 	} finally { await h.cleanup(); }
 });

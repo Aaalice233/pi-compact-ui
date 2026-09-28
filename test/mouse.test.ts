@@ -27,8 +27,8 @@ function state(): CompactExternalGroup {
 test("摘要统计全部调用，按首次出现顺序排列，保留失败和运行状态", () => {
 	const data = state();
 	const group = new CompactExternalGroupComponent(data, plainTheme);
-	assert.match(plain(group)[0]!, /bash×1 edit×2 read×1 · 失败1 · 运行中1/);
-	assert.match(plain(group, 36)[0]!, /失败1 · 运行中1$/, "窄屏优先保留完整状态");
+	assert.match(plain(group)[0]!, /bash×1 edit×2 read×1 · 失败1$/);
+	assert.match(plain(group, 36)[0]!, /失败1$/, "窄屏优先保留完整状态");
 	data.tools.push({ ...data.tools[0]!, id: "5" });
 	assert.match(plain(group)[0]!, /bash×2 edit×2 read×1/);
 	group.setExpanded(true);
