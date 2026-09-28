@@ -61,7 +61,7 @@ test("纯思考默认只显示入口，点击后仍可查看原文", () => {
 	assert.match(group.render(120).join("\n"), /验证过期/);
 });
 
-test("本轮调用进行中逐行保留，调用全部结束后才折回单行", async () => {
+test("调用结束不收起：逐行展开直到本轮回复或运行结束", async () => {
 	await fake.emit("agent_start");
 	const chat = new Container();
 	chat.addChild(new AssistantMessageComponent({ role: "assistant", content: [] } as any));
@@ -73,42 +73,54 @@ test("本轮调用进行中逐行保留，调用全部结束后才折回单行",
 	finish(0, true);
 	const group = chat.children.find((child: any) => child.toolName === "group") as any;
 	const lines = () => group.render(120).filter((line: string) => line.trim()).map(stripTerminalSequences);
-	// 运行中自动展开：本轮的失败行与两条进行中的调用都留在屏幕上，不再“显示一下就没”。
+	// 本块逐行显示：已完成的失败行与两条进行中的调用都在屏幕上。
 	assert.equal(lines().length, 4);
 	assert.match(lines()[0]!, /read×3 · 失败1$/);
 	assert.match(lines()[2]!, /running-a\.ts/);
 	assert.match(lines()[3]!, /running-b\.ts/);
 	finish(2);
-	assert.equal(lines().length, 4, "已经有结果的调用不能让同轮的其他行消失");
+	assert.equal(lines().length, 4, "一个调用结束不能让同轮的其他行消失");
+	assert.match(lines()[1]!, /old\.ts/);
 	finish(1);
-	assert.equal(lines().length, 1, "本轮调用全部结束后折回单行");
+	// 关键：本轮调用都结束了、回复还没来，也不能收起来，否则会出现展开/收起的闪动。
+	assert.equal(lines().length, 4, "调用全部结束但本轮还未封存时仍然保持展开");
+	assert.match(lines()[3]!, /running-b\.ts/);
+	await fake.emit("agent_end");
+	assert.equal(group.sealed, true);
+	assert.equal(lines().length, 1, "本轮回复/运行结束才折回单行");
 	assert.match(lines()[0]!, /read×3 · 失败1/);
 	assert.doesNotMatch(lines()[0]!, /工具返回原文/);
-	await fake.emit("agent_end"); chat.clear();
+	chat.clear();
 });
 
-test("运行中手动收起只约束本轮，下一轮调用重新自动展开", async () => {
+test("手动收起约束整个未封存的块，封存后的新块重新自动展开", async () => {
 	await fake.emit("agent_start");
 	const chat = new Container();
 	chat.addChild(new AssistantMessageComponent({ role: "assistant", content: [] } as any));
 	const tool = new ToolExecutionComponent("read", "manual", { path: "manual.ts" }, {}, { name: "read" } as any, { requestRender() {} } as any, process.cwd());
 	chat.addChild(tool);
 	const group = chat.children.find((child: any) => child.toolName === "group") as any;
-	const head = () => group.render(120).filter((line: string) => line.trim())[0];
-	assert.match(head(), /▾/, "运行中默认逐行显示");
+	const rows = () => group.render(120).filter((line: string) => line.trim());
+	assert.match(rows()[0], /▾/, "运行中默认逐行显示");
 	group.setExpanded(false);
-	assert.match(head(), /▸/, "手动收起后本轮不再自动展开");
-	assert.match(group.render(120).filter((line: string) => line.trim())[1], /manual\.ts/, "进行中的调用行仍然保留");
+	assert.match(rows()[0], /▸/, "手动收起后本块不再自动展开");
+	// 同一个块里继续追加调用，也不能自己弹开。
 	tool.updateResult({ content: [{ type: "text", text: "工具返回原文" }], details: undefined, isError: false }, false);
 	await fake.emit("tool_execution_end", { toolCallId: "manual" });
-	group.render(120);
-	// 下一轮调用开始：手动收起不再跨轮生效。
 	const next = new ToolExecutionComponent("read", "manual-2", { path: "manual-2.ts" }, {}, { name: "read" } as any, { requestRender() {} } as any, process.cwd());
 	chat.addChild(next);
 	await fake.emit("tool_execution_start", { toolCallId: "manual-2", toolName: "read", args: { path: "manual-2.ts" } });
-	const nextLines = group.render(120).filter((line: string) => line.trim());
-	assert.match(nextLines[0], /▾/);
-	assert.equal(nextLines.length, 3, "新的一轮调用重新逐行显示");
+	assert.match(rows()[0], /▸/, "同一块里新增调用不会重新弹开");
+	// 封存后新块由新组件接管，恢复自动展开。
+	await fake.emit("agent_end");
+	assert.match(rows()[0], /▸/);
+	await fake.emit("agent_start");
+	const fresh = new ToolExecutionComponent("read", "fresh", { path: "fresh.ts" }, {}, { name: "read" } as any, { requestRender() {} } as any, process.cwd());
+	chat.addChild(fresh);
+	await fake.emit("tool_execution_start", { toolCallId: "fresh", toolName: "read", args: { path: "fresh.ts" } });
+	const freshGroup = chat.children.filter((child: any) => child.toolName === "group").at(-1) as any;
+	assert.notEqual(freshGroup, group, "封存后的调用属于新的块");
+	assert.match(freshGroup.render(120).filter((line: string) => line.trim())[0], /▾/, "新块重新自动展开");
 	await fake.emit("agent_end"); chat.clear();
 });
 

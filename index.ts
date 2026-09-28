@@ -876,14 +876,17 @@ class ToolGroupComponent extends Container {
 	/** Nested at a visible-text boundary rather than rendered at chat level. */
 	anchored = false;
 	private _expanded = false;
-	/** 运行中用户手动收起：本轮调用全部结束前不再自动展开。 */
-	private collapsedDuringRun = false;
+	/** 用户在这个块里手动收起过：封存之前不再自动展开。 */
+	private collapsedWhileOpen = false;
 	get expanded(): boolean {
 		return this._expanded;
 	}
-	/** 本轮调用还在跑时逐行显示，调用全部结束后自己折回单行。手动展开/收起优先于它。 */
+	/**
+	 * 本块还没有被本轮回复（或运行结束）封存时，逐行显示全部调用。
+	 * 用“封存”而不是“还有调用在跑”作判据：一次调用结束不能把同轮的其他行收起来。
+	 */
 	private autoExpanded(): boolean {
-		return this.hasPending() && !this.collapsedDuringRun;
+		return !this.sealed && this === lastActiveGroup && this.children.length > 0 && !this.collapsedWhileOpen;
 	}
 	/** Sealed: this block was closed by real text output — render from snapshot only. */
 	sealed = false;
@@ -908,8 +911,8 @@ class ToolGroupComponent extends Container {
 	setExpanded(expanded: boolean): void {
 		// 组内工具不再自己渲染，不转发给它们：转发会触发每个工具重跑原生渲染器，
 		// 长会话里按一次 Ctrl+O 就要重算数百个 diff/高亮。
-		// 运行中的手动收起只约束本轮：下一轮调用重新开始自动展开。
-		if (this.hasPending()) this.collapsedDuringRun = !expanded;
+		// 手动收起约束整个未封存的块，直到本轮回复把它封存为止。
+		if (!this.sealed) this.collapsedWhileOpen = !expanded;
 		this._expanded = expanded;
 		this.markDirty();
 	}
@@ -1072,8 +1075,8 @@ class ToolGroupComponent extends Container {
 	}
 
 	render(width: number): string[] {
-		// 本轮调用结束后清除手动收起标记，下一轮调用才能重新自动展开。
-		if (this.collapsedDuringRun && !this.hasPending()) this.collapsedDuringRun = false;
+		// 封存后不再自动展开；新一轮的块由新组件实例负责。
+		if (this.sealed) this.collapsedWhileOpen = false;
 		// 转圈或实时思考中的组每帧都在变（动画帧、耗时、流式思考），不缓存；
 		// 其余状态只在下列 key 或 markDirty() 覆盖的事件中变化。
 		const animating = this.needsAnimation();
