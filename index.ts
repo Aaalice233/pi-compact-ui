@@ -1688,6 +1688,8 @@ export default function (pi: ExtensionAPI) {
 	// 工具状态变化时运行一次（ToolGroupComponent 已不再级联 invalidate）。
 	let configWatcher: FSWatcher | undefined;
 	let reloadTimer: ReturnType<typeof setTimeout> | undefined;
+	// SDK 子会话可能复用这个模块，但每次工厂调用拥有独立的激活状态。
+	// 共享变量服务于 TUI 原型补丁；无界面实例和已关闭实例的事件绝不能写入它们。
 	let uiActive = false;
 
 	const stopConfigWatcher = () => {
@@ -1698,8 +1700,8 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
-		loadConfig();
 		if (ctx.mode !== "tui") return;
+		loadConfig();
 		uiActive = true;
 		ensureConfigFile();
 		currentTheme = ctx.ui.theme;
@@ -1719,11 +1721,13 @@ export default function (pi: ExtensionAPI) {
 		stopConfigWatcher();
 		try {
 			configWatcher = watch(dirname(CONFIG_PATH), (_type, filename) => {
+				if (!uiActive) return;
 				if (filename && String(filename) !== basename(CONFIG_PATH)) return;
 				if (reloadTimer) clearTimeout(reloadTimer);
 				// 一次保存会触发多个事件，合并后再读，也避免读到写到一半的文件。
 				reloadTimer = setTimeout(() => {
 					reloadTimer = undefined;
+					if (!uiActive) return;
 					loadConfig();
 					for (const g of groups) g.invalidate();
 					capturedTui?.requestRender?.();
@@ -1735,14 +1739,16 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("session_shutdown", async (event) => {
+	pi.on("session_shutdown", async (event, ctx) => {
+		// 共享 ResourceLoader 时甚至可能复用处理器本身，必须先按本次事件的模式隔离。
+		if (ctx.mode !== "tui") return;
 		stopConfigWatcher();
+		if (!uiActive) return;
+		uiActive = false;
 		if (animTimer) {
 			clearTimeout(animTimer);
 			animTimer = null;
 		}
-		if (!uiActive) return;
-		uiActive = false;
 		// /reload 时 pi 会在新实例的 session_start 之前就重建对话记录；此时还原补丁
 		// 会让整段历史按原生样式重建。补丁保留到新实例安装时整体替换。
 		// 其他关闭原因才还原全局原型。
@@ -1750,12 +1756,14 @@ export default function (pi: ExtensionAPI) {
 		capturedTui = null;
 	});
 
-	pi.on("tool_execution_start", async (event) => {
+	pi.on("tool_execution_start", async (event, ctx) => {
+		if (!uiActive || ctx.mode !== "tui") return;
 		toolStarts.set(event.toolCallId, Date.now());
 		lastActiveGroup?.markDirty();
 	});
 
-	pi.on("tool_execution_end", async (event) => {
+	pi.on("tool_execution_end", async (event, ctx) => {
+		if (!uiActive || ctx.mode !== "tui") return;
 		for (const g of groups) {
 			for (const t of g.children as any[]) {
 				if (t.toolCallId === event.toolCallId) {
@@ -1769,7 +1777,8 @@ export default function (pi: ExtensionAPI) {
 	// 以运行为单位划分回合。pi-goal-x 的自动续跑、pi-subagents 的完成通知等会用隐藏的
 	// custom 消息触发新一轮，没有 user 消息；只看 user 消息会让 "worked for" 把上一轮之后的
 	// 空闲时间也算进去，并把上一轮残留的思考带进新组。
-	pi.on("agent_start", async () => {
+	pi.on("agent_start", async (_event, ctx) => {
+		if (!uiActive || ctx.mode !== "tui") return;
 		sealActiveGroup();
 		turnStartMs = Date.now();
 		resetThinkingState();
@@ -1778,7 +1787,8 @@ export default function (pi: ExtensionAPI) {
 		pendingTextOrdinal = null;
 	});
 
-	pi.on("message_start", async (event) => {
+	pi.on("message_start", async (event, ctx) => {
+		if (!uiActive || ctx.mode !== "tui") return;
 		const role = (event.message as any)?.role;
 		// A new user message is a hard turn boundary: seal whatever block is still
 		// open. Assistant/toolResult message boundaries do NOT seal — thinking and
@@ -1806,7 +1816,8 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("message_update", async (event) => {
+	pi.on("message_update", async (event, ctx) => {
+		if (!uiActive || ctx.mode !== "tui") return;
 		const msg = event.message as any;
 		if (!msg || msg.role !== "assistant") return;
 		const content = Array.isArray(msg.content) ? msg.content : [];
@@ -1861,7 +1872,8 @@ export default function (pi: ExtensionAPI) {
 		lastActiveGroup?.markDirty();
 	});
 
-	pi.on("agent_end", async () => {
+	pi.on("agent_end", async (_event, ctx) => {
+		if (!uiActive || ctx.mode !== "tui") return;
 		// Turn finished: freeze the final block so it stops spinning and shows a
 		// stable summary until the user starts the next turn.
 		sealActiveGroup();
@@ -1890,7 +1902,7 @@ export default function (pi: ExtensionAPI) {
 		description: "紧凑界面设置（方向键选择，Enter 调整，Esc 关闭）",
 		handler: async (_args, ctx) => {
 			// Non-TUI modes (print/json) can't show the interactive menu.
-			if (ctx.mode !== "tui") {
+			if (!uiActive || ctx.mode !== "tui") {
 				ctx.ui.notify(
 					`compact: expandedThinkingLines=${config.expandedThinkingLines}, nativeTools=${config.nativeTools.join(",")} (${CONFIG_PATH})`,
 					"info",

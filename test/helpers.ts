@@ -32,7 +32,7 @@ export function createFakePi(theme = plainTheme) {
 	};
 	const ctx = (mode: string) => ({
 		mode,
-		hasUI: mode === "tui",
+		hasUI: mode === "tui" || mode === "rpc",
 		ui: {
 			theme,
 			setHiddenThinkingLabel() {},
