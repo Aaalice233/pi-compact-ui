@@ -907,17 +907,26 @@ class ToolGroupComponent extends Container {
 	/** Nested at a visible-text boundary rather than rendered at chat level. */
 	anchored = false;
 	private _expanded = false;
-	/** 用户在这个块里手动收起过：封存之前不再自动展开。 */
-	private collapsedWhileOpen = false;
+	/**
+	 * 封存后的手动展开。点击标题或 Ctrl+O 的结果会保留到用户再次切换，
+	 * 否则收向单行后就再也打不开历史块了。
+	 */
 	get expanded(): boolean {
-		return this._expanded;
+		return this.effectiveExpanded();
 	}
 	/**
-	 * 本块还没有被本轮回复（或运行结束）封存时，逐行显示全部调用。
-	 * 用“封存”而不是“还有调用在跑”作判据：一次调用结束不能把同轮的其他行收起来。
+	 * 未封存期间的手动意图：auto 表示跟随自动展开（本块还在末尾时逐行显示），
+	 * expand/collapse 是用户在运行中手动指定，**只对本块有效**。
+	 * 否则 Ctrl+O 按过一次就会让本轮的历史块永远摊开着。
 	 */
-	private autoExpanded(): boolean {
-		return !this.sealed && this === lastActiveGroup && this.children.length > 0 && !this.collapsedWhileOpen;
+	private openIntent: "auto" | "expand" | "collapse" = "auto";
+
+	private effectiveExpanded(): boolean {
+		if (this.sealed) return this._expanded;
+		if (this.openIntent === "expand") return true;
+		if (this.openIntent === "collapse") return false;
+		// 本块还在末尾时逐行显示；正文或新块出现后就回到单行。
+		return this.children.length > 0 && this === lastActiveGroup;
 	}
 	/** Sealed: this block was closed by real text output — render from snapshot only. */
 	sealed = false;
@@ -942,14 +951,14 @@ class ToolGroupComponent extends Container {
 	setExpanded(expanded: boolean): void {
 		// 组内工具不再自己渲染，不转发给它们：转发会触发每个工具重跑原生渲染器，
 		// 长会话里按一次 Ctrl+O 就要重算数百个 diff/高亮。
-		// 手动收起约束整个未封存的块，直到本轮回复把它封存为止。
-		if (!this.sealed) this.collapsedWhileOpen = !expanded;
-		this._expanded = expanded;
+		// 未封存时的手动展开/收起只属于本块：本轮回复一到就回到自动行为。
+		if (this.sealed) this._expanded = expanded;
+		else this.openIntent = expanded ? "expand" : "collapse";
 		this.markDirty();
 	}
 
 	handleMouse(event: TuiMouseEvent): ReturnType<Container["handleMouse"]> {
-		return clickGroupHeader(this, event, this.anchored ? 0 : 1, this.headerColumns, () => this.setExpanded(!this._expanded));
+		return clickGroupHeader(this, event, this.anchored ? 0 : 1, this.headerColumns, () => this.setExpanded(!this.effectiveExpanded()));
 	}
 
 	addTool(tool: any): void {
@@ -1072,7 +1081,7 @@ class ToolGroupComponent extends Container {
 		const tText = this.liveThinking().trim();
 		const total = this.children.length;
 		// 自动展开（本轮调用进行中）只列调用行：流式思考的 Markdown 每帧重解析，代价不值得付。
-		const hasThinking = !!tText && (this._expanded || total === 0);
+		const hasThinking = !!tText && (this.effectiveExpanded() || total === 0);
 		const lines = [groupHeading(theme, this.children, toolStatus, true, working, width)];
 		lines.push(...this.toolLines(this.children.map((tool, index) => ({ rail: index === total - 1 && !hasThinking ? "╰  " : "│  ", tool })), width));
 
@@ -1105,14 +1114,14 @@ class ToolGroupComponent extends Container {
 
 	render(width: number): string[] {
 		// 封存后不再自动展开；新一轮的块由新组件实例负责。
-		if (this.sealed) this.collapsedWhileOpen = false;
+		if (this.sealed && this.openIntent !== "auto") this.openIntent = "auto";
 		// 调用行不跟随终端变宽：一条超长命令会把整块顶到屏幕边缘，同组其他行的数字
 		// 也要跨过整屏去读。上限可用配置调整，但永远不超出实际可用宽度。
 		const limit = Math.max(1, Math.min(width, config.rowMaxWidth));
 		// 转圈或实时思考中的组每帧都在变（动画帧、耗时、流式思考），不缓存；
 		// 其余状态只在下列 key 或 markDirty() 覆盖的事件中变化。
 		const animating = this.needsAnimation();
-		const expanded = this._expanded || this.autoExpanded();
+		const expanded = this.effectiveExpanded();
 		const key = animating
 			? ""
 			: `${limit}|${expanded ? 1 : 0}|${this.anchored ? 1 : 0}|${this.sealed ? 1 : 0}|${this === lastActiveGroup ? 1 : 0}|${this.children.length}|${this.children.map(toolStatus).join(",")}`;

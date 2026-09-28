@@ -61,6 +61,43 @@ test("纯思考默认只显示入口，点击后仍可查看原文", () => {
 	assert.match(group.render(120).join("\n"), /验证过期/);
 });
 
+test("运行中的手动展开不跨本轮，封存后的手动展开仍然保留", async () => {
+	await fake.emit("agent_start");
+	const chat = new Container();
+	chat.addChild(new AssistantMessageComponent({ role: "assistant", content: [] } as any));
+	const tools = ["manual-a", "manual-b"].map((id) => {
+		const tool = new ToolExecutionComponent("read", id, { path: `${id}.ts` }, {}, { name: "read" } as any, { requestRender() {} } as any, process.cwd());
+		chat.addChild(tool);
+		tool.updateResult({ content: [{ type: "text", text: "工具返回原文" }], details: undefined, isError: false } as any, false);
+		return tool;
+	});
+	const group = chat.children.find((child: any) => child.toolName === "group") as any;
+	const rows = () => group.render(120).filter((line: string) => line.trim());
+	assert.equal(rows().length, 3, "本块在末尾时逐行显示");
+	group.setExpanded(false);
+	assert.equal(rows().length, 1, "运行中手动收起");
+	// 模拟 Ctrl+O（或点击标题）把它展开。
+	group.setExpanded(true);
+	assert.deepEqual(rows().map(stripTerminalSequences).slice(1), [
+		" │  ✓ read  manual-a.ts",
+		" ╰  ✓ read  manual-b.ts",
+	]);
+	// 本轮正文到达 → 封存；运行中的手动展开不能跨过这一轮。
+	const message: any = { role: "assistant", content: [{ type: "text", text: "改好了。" }] };
+	await fake.emit("message_start", { message });
+	chat.addChild(new AssistantMessageComponent(message));
+	await fake.emit("message_update", { message, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "改好了。" } });
+	assert.equal(group.sealed, true);
+	assert.equal(rows().length, 1, "本轮回复出现后必须折回单行，与它之前被 Ctrl+O 展开过无关");
+	// 封存后的手动展开（点击 / Ctrl+O 看历史）仍然保留。
+	group.setExpanded(true);
+	assert.equal(rows().length, 3, "封装后的手动展开保留，否则历史块再也打不开");
+	group.setExpanded(false);
+	assert.equal(rows().length, 1);
+	assert.equal(tools.length, 2);
+	await fake.emit("agent_end"); chat.clear();
+});
+
 test("调用结束不收起：逐行展开直到本轮回复或运行结束", async () => {
 	await fake.emit("agent_start");
 	const chat = new Container();
