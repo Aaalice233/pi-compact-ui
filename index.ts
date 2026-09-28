@@ -7,9 +7,9 @@
  * merged into the same block.
  *
  * Collapsed (max 3 lines by default, configurable):
- *   ⠋ tool calling...
- *   │  ✓ bash: ls /tmp && cat fi... (3s)
- *   └  · thinking: Planning... · ≈1.2K tok
+ *   ▸ 3 个工具 · 1 失败                  思考 1.2K
+ *   │  ✗ bash  npm test · 断言失败             3.2s
+ *   ╰  验证过期会话分支……
  *
  * Ctrl+O toggles collapse/expand (via setExpanded, same as built-in tools).
  * Expand line counts are configurable via /compact-ui-config (interactive
@@ -92,7 +92,9 @@ export function resolveConfig(raw: unknown): CompactConfig {
 	const source = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
 	const numberOr = (key: "collapsedMaxLines" | "expandedToolLines" | "expandedThinkingLines") => {
 		const value = source[key];
-		return typeof value === "number" && Number.isFinite(value) ? value : DEFAULT_CONFIG[key];
+		const meta = CONFIG_KEYS.find((item) => item.id === key)!;
+		return typeof value === "number" && Number.isFinite(value)
+			? Math.min(meta.max, Math.max(meta.min, Math.floor(value))) : DEFAULT_CONFIG[key];
 	};
 	const nativeTools = Array.isArray(source.nativeTools)
 		? source.nativeTools.filter((name): name is string => typeof name === "string" && name.trim().length > 0)
@@ -149,24 +151,24 @@ function saveConfig(): void {
 const CONFIG_KEYS = [
 	{
 		id: "collapsedMaxLines",
-		label: "Collapsed max lines",
-		description: "Max lines shown when a tool group is collapsed",
+		label: "折叠行数",
+		description: "工具组折叠时的总行数（含标题和思考预览）",
 		min: 2,
 		max: 20,
 		step: 1,
 	},
 	{
 		id: "expandedToolLines",
-		label: "Expanded tool lines",
-		description: "Result lines shown per tool when expanded",
+		label: "工具预览",
+		description: "展开后，每个工具显示的结果行数",
 		min: 1,
 		max: 50,
 		step: 1,
 	},
 	{
 		id: "expandedThinkingLines",
-		label: "Expanded thinking lines",
-		description: "Thinking lines shown when expanded",
+		label: "思考预览",
+		description: "展开后，显示的思考行数",
 		min: 1,
 		max: 100,
 		step: 1,
@@ -201,7 +203,7 @@ function makeStepper(
 				`  ${fg("accent", String(value))}`,
 				`  ${fg("muted", bar)}`,
 				"",
-				fg("dim", "  ◀ ▶ / − +  adjust    Enter  save    Esc  cancel"),
+				fg("muted", "  ← → 调整 · Enter 保存 · Esc 返回"),
 			].map((line) => truncateToWidth(line, Math.max(1, width)));
 			cachedWidth = width;
 			return cachedLines;
@@ -273,8 +275,11 @@ function shortenPath(path: string): string {
 }
 
 function oneLine(value: unknown, max = 60): string {
-	const text = String(value ?? "").replace(/\s+/g, " ").trim();
-	return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+	// 先限长再清理：流式思考和命令可能很大，预览不应每帧扫描全文。
+	const source = String(value ?? "");
+	const bounded = source.slice(0, Math.max(512, max * 8));
+	const text = stripTerminalSequences(bounded).replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim();
+	return truncateToWidth(text + (bounded.length < source.length ? "…" : ""), Math.max(1, max), "…");
 }
 
 function estimateTextTokens(text: string): number {
@@ -320,6 +325,10 @@ function toolSummary(name: string, args: any): { name: string; content: string }
 			return { name: "web_search", content: oneLine(args?.query || "…") };
 		case "subagent":
 			return { name: "subagent", content: oneLine(args?.agent || args?.task || "…") };
+		case "mcp":
+			return { name: "mcp", content: oneLine(args?.tool ?? args?.search ?? args?.describe ?? args?.server ?? "…") };
+		case "mcpScript":
+			return { name: "mcpScript", content: oneLine(args?.code ?? "…") };
 		default: {
 			const preferred = args?.path ?? args?.query ?? args?.name ?? args?.description ?? args?.url;
 			return { name, content: oneLine(preferred ?? "…") };
@@ -338,9 +347,12 @@ function toolStatus(tool: any): ToolStatus {
 }
 
 function toolElapsed(tool: any): string {
-	const start = toolStarts.get(tool.toolCallId) ?? Date.now();
-	const end = tool?.result || tool?._groupInterrupted ? tool._groupEndAt ?? Date.now() : Date.now();
-	return (Math.max(0, end - start) / 1000).toFixed(1);
+	const start = toolStarts.get(tool.toolCallId);
+	// 历史结果没有执行计时，不能用加载时间伪造 0.0s。
+	if (start === undefined) return "";
+	if ((tool?.result || tool?._groupInterrupted) && tool._groupEndAt === undefined) return "";
+	const end = tool._groupEndAt ?? Date.now();
+	return `${(Math.max(0, end - start) / 1000).toFixed(1)}s`;
 }
 
 function toolResultText(tool: any): string {
@@ -349,6 +361,92 @@ function toolResultText(tool: any): string {
 		.map((c: any) => String(c.text))
 		.join("\n")
 		.trim();
+}
+
+// 主会话和子代理视图共用排版：状态有文字兜底，元数据右对齐，窄屏先让出元数据。
+function alignRow(left: string, right: string, width: number): string {
+	const available = Math.max(1, width);
+	if (!right || available < 36) return truncateToWidth(left, available, "…");
+	const rightWidth = visibleWidth(right);
+	const clipped = truncateToWidth(left, Math.max(1, available - rightWidth - 2), "…");
+	return clipped + " ".repeat(Math.max(1, available - visibleWidth(clipped) - rightWidth)) + right;
+}
+
+function groupHeading(theme: any, tools: any[], status: (tool: any) => ToolStatus, expanded: boolean,
+	working: boolean, thinking: boolean, tokens: string, width: number): string {
+	const fg = (color: string, value: string) => theme?.fg?.(color, value) ?? value;
+	const failed = tools.filter((tool) => status(tool) === "error").length;
+	const pending = tools.filter((tool) => status(tool) === "pending").length;
+	const frame = SPINNER[Math.floor((Date.now() - spinnerStart) / SPINNER_MS) % SPINNER.length]!;
+	const label = tools.length ? `${tools.length} 个工具` : working ? "正在思考" : "思考记录";
+	const detail = failed ? fg("error", ` · ${failed} 失败`) : pending ? fg("accent", ` · ${pending} 运行中`) : "";
+	const icon = working ? fg("accent", frame) : fg("muted", expanded ? "▾" : "▸");
+	const title = `${icon} ${fg(working ? "accent" : "muted", label)}${detail}`;
+	return alignRow(title, thinking ? fg("dim", `思考 ${tokens}`) : "", width - GROUP_PADDING_X);
+}
+
+function selectedTools<T>(tools: T[], limit: number, status: (tool: T) => ToolStatus): T[] {
+	// 先保留失败和运行中的工具，再补最近的成功项；显示顺序仍按调用时间。
+	const priority = [...tools].reverse();
+	const chosen = new Set<T>();
+	for (const tool of [...priority.filter((item) => status(item) === "error"), ...priority.filter((item) => status(item) === "pending"), ...priority]) {
+		if (chosen.size >= limit) break;
+		chosen.add(tool);
+	}
+	return tools.filter((tool) => chosen.has(tool));
+}
+
+function compactToolRow(theme: any, rail: string, name: string, args: any, status: ToolStatus,
+	elapsed: string, detail: string, width: number, nameWidth: number): string {
+	const fg = (color: string, value: string) => theme?.fg?.(color, value) ?? value;
+	const summary = toolSummary(name, args);
+	const title = truncateToWidth(oneLine(summary.name, nameWidth), nameWidth, "…");
+	const paddedTitle = title + " ".repeat(Math.max(0, nameWidth - visibleWidth(title)));
+	const icon = status === "pending" ? "·" : status === "error" ? "✗" : "✓";
+	const stateColor = status === "error" ? "error" : status === "pending" ? "accent" : "dim";
+	const payload = status === "error" && detail
+		? width >= 64 ? `${oneLine(summary.content, 28)} · ${detail}` : detail
+		: summary.content;
+	const left = `${fg("dim", rail)}${fg(stateColor, icon)} ${fg("toolTitle", paddedTitle)}  ${fg(status === "error" ? "error" : "muted", payload)}`;
+	return alignRow(left, fg("dim", [status !== "error" ? detail : "", elapsed].filter(Boolean).join(" · ")), width - GROUP_PADDING_X);
+}
+
+const resultSummaryCache = new WeakMap<object, string>();
+function resultSummary(tool: any): string {
+	if (tool._groupInterrupted) return "已中断";
+	const result = tool.result;
+	if (!result || toolStatus(tool) === "pending") return "";
+	const cached = resultSummaryCache.get(result);
+	if (cached !== undefined) return cached;
+	const text = String(result.content?.find((block: any) => block.type === "text")?.text ?? "").slice(0, 4096);
+	let summary = "";
+	if (result.isError) summary = oneLine(text.split("\n").find((line) => line.trim()), 100) || "执行失败";
+	else if (tool.toolName === "bash" || tool.toolName === "powershell") {
+		const exit = /(?:exit(?:ed)?(?: with)?(?: code)?|退出码)[:\s]+(-?\d+)/i.exec(text);
+		if (exit) summary = `退出 ${exit[1]}`;
+	} else if (tool.toolName === "read") {
+		const lines = /(?:Showing|Lines?)\s+(\d+)\s*[-–:]\s*(\d+)/i.exec(text);
+		if (lines) summary = `${lines[1]}–${lines[2]} 行`;
+	} else if (tool.toolName === "edit" && typeof result.details?.diff === "string") {
+		// 只统计实际返回的 diff，不能把替换参数的行数当作真实改动数。
+		const rows = result.details.diff.split("\n");
+		summary = `+${rows.filter((line: string) => /^\+(?!\+\+)/.test(line)).length} −${rows.filter((line: string) => /^-(?!--)/.test(line)).length}`;
+	} else if (tool.toolName === "grep" || tool.toolName === "find") {
+		const count = result.details?.totalMatches ?? result.details?.total;
+		if (Number.isSafeInteger(count) && count >= 0) summary = `${count} 项`;
+	}
+	resultSummaryCache.set(result, summary);
+	return summary;
+}
+
+function nameColumn(tools: any[], width: number, name: (tool: any) => string): number {
+	return Math.min(width < 50 ? 8 : 16, tools.reduce((max, tool) => Math.max(max, visibleWidth(name(tool))), 4));
+}
+
+function thinkingPreview(theme: any, source: string, width: number): string {
+	const fg = (color: string, value: string) => theme?.fg?.(color, value) ?? value;
+	const preview = oneLine(source, Math.max(1, width - GROUP_PADDING_X - 4));
+	return fg("dim", "╰  ") + fg("thinkingText", theme?.italic?.(preview) ?? preview);
 }
 
 type MarkdownPreview = {
@@ -491,35 +589,25 @@ export class CompactExternalGroupComponent implements Component {
 
 	invalidate(): void {}
 
-	private icon(tool: CompactExternalTool, frame: string): string {
-		return tool.status === "pending" ? frame : tool.status === "error" ? "✗" : "✓";
-	}
-
-	private color(tool: CompactExternalTool): string {
-		return tool.status === "pending" ? "accent" : tool.status === "error" ? "error" : "success";
-	}
-
 	private elapsed(tool: CompactExternalTool): string {
 		const end = tool.endedAt ?? Date.now();
 		return `${Math.max(0, (end - tool.startedAt) / 1000).toFixed(1)}s`;
 	}
 
-	private toolRow(rail: string, tool: CompactExternalTool, frame: string): string {
-		const fg = (color: string, text: string) => this.theme?.fg?.(color, text) ?? text;
-		const bold = this.theme?.bold ? (text: string) => this.theme.bold(text) : (text: string) => text;
-		const summary = toolSummary(tool.name, tool.args);
-		return `${fg("dim", rail)}${fg(this.color(tool), this.icon(tool, frame))} ${fg("toolTitle", bold(summary.name))} ${fg("dim", summary.content)} ${fg("muted", `(${this.elapsed(tool)})`)}`;
+	private toolRow(rail: string, tool: CompactExternalTool, width: number, column: number): string {
+		return compactToolRow(this.theme, rail, tool.name, tool.args, tool.status, this.elapsed(tool),
+			tool.status === "error" ? oneLine(tool.resultText.slice(0, 4096).split("\n").find((line) => line.trim()), 100) || "执行失败" : "", width, column);
 	}
 
 	private tokenLabel(): string {
 		const tokens = this.state.thinkingTokens ?? estimateTextTokens(this.state.thinking);
-		return `${this.state.thinkingTokensExact ? "" : "≈"}${formatTokenK(tokens)} tok`;
+		return `${this.state.thinkingTokensExact ? "" : "≈"}${formatTokenK(tokens)}`;
 	}
 
 	private markdownLines(source: string, width: number, maxLines: number, color: string, italic = false): string[] {
 		if (!source.trim()) return [];
 		const lineLimit = Math.max(1, maxLines);
-		const sourceRows = source.split("\n");
+		const sourceRows = source.slice(0, Math.max(4096, lineLimit * Math.max(40, width) * 4)).split("\n");
 		const bounded = sourceRows
 			.slice(0, Math.max(lineLimit * 4, lineLimit + 20))
 			.join("\n")
@@ -536,51 +624,30 @@ export class CompactExternalGroupComponent implements Component {
 		return lines;
 	}
 
-	private renderCollapsed(width: number, frame: string): string[] {
-		const fg = (color: string, text: string) => this.theme?.fg?.(color, text) ?? text;
-		const pending = this.state.tools.some((tool) => tool.status === "pending");
-		const openThinking = this.state.thinkingActive && !this.state.sealed;
-		const openEmpty = !this.state.sealed && this.state.tools.length === 0;
-		const working = pending || openThinking || openEmpty;
-		const label = pending ? "tool calling..." : openThinking || openEmpty ? "thinking..." : "tools done";
-		const color = pending ? "accent" : openThinking || openEmpty ? "thinkingText" : "success";
-		const lines = [`${fg(color, working ? frame : "✓")} ${fg(color, label)}`];
-		const maxLines = Math.max(2, config.collapsedMaxLines);
-		const thinking = this.state.thinking.trim().replace(/[*_#`>]+/g, "");
-		const reserveThinking = thinking.length > 0;
-		let shown = 0;
-		for (let index = this.state.tools.length - 1; index >= 0; index--) {
-			if (lines.length >= maxLines - (reserveThinking ? 1 : 0)) break;
-			const isOldest = index === 0 && !reserveThinking;
-			lines.push(this.toolRow(isOldest ? "└  " : "│  ", this.state.tools[index]!, frame));
-			shown++;
-		}
-		if (shown < this.state.tools.length && lines.length < maxLines) {
-			lines.push(`${fg("dim", "│  ")} ${fg("muted", `… +${this.state.tools.length - shown} more`)}`);
-		}
-		if (reserveThinking && lines.length < maxLines) {
-			const previewWidth = Math.max(1, Math.min(50, width - GROUP_PADDING_X - 18 - this.tokenLabel().length));
-			lines.push(
-				`${fg("dim", "└  ")}${fg("muted", "·")} ${fg("thinkingText", `thinking: ${oneLine(thinking, previewWidth)}`)} ${fg("muted", `· ${this.tokenLabel()}`)}`,
-			);
-		}
+	private renderCollapsed(width: number): string[] {
+		const status = (tool: CompactExternalTool) => tool.status;
+		const working = this.state.tools.some((tool) => tool.status === "pending") || (!this.state.sealed && (this.state.thinkingActive || !this.state.tools.length));
+		const thinking = this.state.thinking;
+		const keepThinking = !!thinking.trim() && (config.collapsedMaxLines > 2 || !this.state.tools.length);
+		const lines = [groupHeading(this.theme, this.state.tools, status, false, working, !!thinking.trim(), this.tokenLabel(), width)];
+		const shown = selectedTools(this.state.tools, Math.max(1, config.collapsedMaxLines - 1 - (keepThinking ? 1 : 0)), status);
+		const column = nameColumn(shown, width, (tool) => tool.name);
+		shown.forEach((tool, index) => lines.push(this.toolRow(index === shown.length - 1 && !keepThinking ? "╰  " : "│  ", tool, width, column)));
+		if (keepThinking) lines.push(thinkingPreview(this.theme, thinking, width));
 		return lines;
 	}
 
-	private renderExpanded(width: number, frame: string): string[] {
+	private renderExpanded(width: number): string[] {
 		const fg = (color: string, text: string) => this.theme?.fg?.(color, text) ?? text;
-		const pending = this.state.tools.some((tool) => tool.status === "pending");
-		const openThinking = this.state.thinkingActive && !this.state.sealed;
-		const openEmpty = !this.state.sealed && this.state.tools.length === 0;
-		const working = pending || openThinking || openEmpty;
-		const label = pending ? "tool calling..." : openThinking || openEmpty ? "thinking..." : "tools done";
-		const color = pending ? "accent" : openThinking || openEmpty ? "thinkingText" : "success";
-		const lines = [`${fg(color, working ? frame : "✓")} ${fg(color, label)}`];
+		const working = this.state.tools.some((tool) => tool.status === "pending") || (!this.state.sealed && (this.state.thinkingActive || !this.state.tools.length));
+		const hasThinking = !!this.state.thinking.trim();
+		const lines = [groupHeading(this.theme, this.state.tools, (tool) => tool.status, true, working, hasThinking, this.tokenLabel(), width)];
+		const column = nameColumn(this.state.tools, width, (tool) => tool.name);
 		for (let index = 0; index < this.state.tools.length; index++) {
 			const tool = this.state.tools[index]!;
-			const last = index === this.state.tools.length - 1;
+			const last = index === this.state.tools.length - 1 && !hasThinking;
 			const sub = last ? "    " : "│   ";
-			lines.push(this.toolRow(last ? "└─ " : "├─ ", tool, frame));
+			lines.push(this.toolRow(last ? "╰  " : "├  ", tool, width, column));
 			for (const row of this.markdownLines(
 				tool.resultText,
 				Math.max(1, width - GROUP_PADDING_X - sub.length),
@@ -592,7 +659,7 @@ export class CompactExternalGroupComponent implements Component {
 		}
 		if (this.state.thinking.trim()) {
 			lines.push(
-				`${fg("dim", "└  ")}${fg("muted", "·")} ${fg("thinkingText", "thinking")} ${fg("muted", `· ${this.tokenLabel()}`)}`,
+				`${fg("dim", "╰  ")}${fg("thinkingText", "思考")} ${fg("muted", `· ${this.tokenLabel()}`)}`,
 			);
 			for (const row of this.markdownLines(
 				this.state.thinking,
@@ -608,8 +675,7 @@ export class CompactExternalGroupComponent implements Component {
 	}
 
 	render(width: number): string[] {
-		const frame = SPINNER[Math.floor((Date.now() - spinnerStart) / SPINNER_MS) % SPINNER.length]!;
-		const source = this.expanded ? this.renderExpanded(width, frame) : this.renderCollapsed(width, frame);
+		const source = this.expanded ? this.renderExpanded(width) : this.renderCollapsed(width);
 		const padding = " ".repeat(Math.min(GROUP_PADDING_X, Math.max(0, width - 1)));
 		const contentWidth = Math.max(1, width - padding.length);
 		return source.map((line) => padding + truncateToWidth(line, contentWidth, "…"));
@@ -656,13 +722,13 @@ class CompactionHeaderComponent implements Component {
 		const fg = (color: string, text: string) => theme?.fg?.(color, text) ?? text;
 		const exactTokens = Math.max(0, this.tokensBefore).toLocaleString();
 		const icon = fg("success", "›‹");
-		const title = fg("success", "Context compacted");
-		const detail = fg("muted", ` • ${exactTokens} tokens → summary`);
+		const title = fg("muted", "上下文已压缩");
+		const detail = fg("dim", ` · ${exactTokens} token → 摘要`);
 		const full = `${icon} ${title}${detail}`;
 		if (visibleWidth(full) <= width) return [full];
 
-		const compactTitle = fg("success", "Compacted");
-		const compactDetail = fg("muted", ` • ${formatTokenK(this.tokensBefore)} tok`);
+		const compactTitle = fg("muted", "已压缩");
+		const compactDetail = fg("dim", ` · ${formatTokenK(this.tokensBefore)}`);
 		return [truncateToWidth(`${icon} ${compactTitle}${compactDetail}`, Math.max(1, width), "…")];
 	}
 
@@ -868,11 +934,11 @@ class ToolGroupComponent extends Container {
 		// Only a bounded prefix can become visible. This prevents a very large
 		// command result from being reparsed in full merely to display a handful
 		// of expanded lines. Incomplete closing fences are supported by pi-tui.
-		const sourceRows = source.split("\n");
+		const sourceRows = source.slice(0, Math.max(4096, lineLimit * Math.max(40, renderWidth) * 4)).split("\n");
 		const sourceLineLimit = Math.max(lineLimit * 4, lineLimit + 20);
 		const sourceCharLimit = Math.max(4096, lineLimit * Math.max(40, renderWidth) * 4);
 		let markdownSource = sourceRows.slice(0, sourceLineLimit).join("\n");
-		let sourceTruncated = sourceRows.length > sourceLineLimit;
+		let sourceTruncated = sourceRows.length > sourceLineLimit || markdownSource.length < source.length;
 		if (markdownSource.length > sourceCharLimit) {
 			markdownSource = markdownSource.slice(0, sourceCharLimit);
 			sourceTruncated = true;
@@ -891,21 +957,8 @@ class ToolGroupComponent extends Container {
 		return preview;
 	}
 
-	private iconFor(tool: any, frame: string): string {
-		const st = toolStatus(tool);
-		return st === "pending" ? frame : st === "error" ? "✗" : "✓";
-	}
-	private colorFor(status: string): string {
-		return status === "pending" ? "accent" : status === "error" ? "error" : "success";
-	}
-	// Tool name in bold accent, tool payload in dim.
-	private toolRow(rail: string, tool: any, frame: string): string {
-		const theme = currentTheme;
-		const fg = (color: string, text: string) => theme?.fg?.(color, text) ?? text;
-		const bold = theme?.bold ? theme.bold : (t: string) => t;
-		const st = toolStatus(tool);
-		const s = toolSummary(tool.toolName, tool.args);
-		return `${fg("dim", rail)}${fg(this.colorFor(st), this.iconFor(tool, frame))} ${fg("toolTitle", bold(s.name))} ${fg("dim", s.content)} ${fg("muted", `(${toolElapsed(tool)}s)`)}`;
+	private toolRow(rail: string, tool: any, width: number, column: number): string {
+		return compactToolRow(currentTheme, rail, tool.toolName, tool.args, toolStatus(tool), toolElapsed(tool), resultSummary(tool), width, column);
 	}
 	// Live state only applies to the not-yet-sealed (active) block.
 	private liveThinking(): string {
@@ -914,63 +967,23 @@ class ToolGroupComponent extends Container {
 	private liveThinkingTokenLabel(): string {
 		const tokens = this.sealed || this !== lastActiveGroup ? this.thinkingTokensFrozen : thinkingTokenCount;
 		const exact = this.sealed || this !== lastActiveGroup ? this.thinkingTokensFrozenExact : thinkingTokenCountExact;
-		return `${exact ? "" : "≈"}${formatTokenK(tokens)} tok`;
+		return `${exact ? "" : "≈"}${formatTokenK(tokens)}`;
 	}
 	private liveThinkingActive(): boolean {
-		return !this.sealed && thinkingActive;
-	}
-	private livePending(): boolean {
-		return !this.sealed && this.children.some((t) => toolStatus(t) === "pending");
+		return this === lastActiveGroup && !this.sealed && thinkingActive;
 	}
 
 	// Folded: header + up to collapsedMaxLines total, ellipsis when exceeding.
 	private renderCollapsed(width: number): string[] {
-		const theme = currentTheme;
-		const fg = (color: string, text: string) => theme?.fg?.(color, text) ?? text;
-		const frame = SPINNER[Math.floor((Date.now() - spinnerStart) / SPINNER_MS) % SPINNER.length]!;
-		const lines: string[] = [];
-
-		const hasPendingTool = this.hasPending();
-		const isThinking = this.liveThinkingActive();
-		// An open block with no tools yet is still "thinking" (waiting for tools or
-		// a text seal); only sealed / tool-bearing blocks show a completion mark.
-		const openNoTools = !this.sealed && this.children.length === 0;
-		const working = hasPendingTool || isThinking || openNoTools;
-		const state = hasPendingTool ? "tool calling..." : isThinking || openNoTools ? "thinking..." : "tools done";
-		const stateColor = hasPendingTool ? "accent" : isThinking || openNoTools ? "thinkingText" : "success";
-		// Left icon: spinner while working, completion mark once the group is done.
-		const leftIcon = working ? frame : "✓";
-		lines.push(`${fg(stateColor, leftIcon)} ${fg(stateColor, state)}`);
-
-		const maxLines = Math.max(2, config.collapsedMaxLines);
-		const total = this.children.length;
-		const tText = this.liveThinking().trim().replace(/[*_#`>]+/g, "");
-
-		// Reserve the last line for the thinking footer when there is one.
-		// Folded tools are listed newest-first: the most recent call sits on top.
-		const keepThinking = tText.length > 0;
-		let shown = 0;
-		for (let index = 0; index < total; index++) {
-			const room = maxLines - (keepThinking ? 1 : 0);
-			if (lines.length >= room) break;
-			const tool = this.children[total - 1 - index];
-			const isLastTool = index === total - 1 && !keepThinking;
-			const rail = isLastTool ? "└  " : "│  ";
-			lines.push(this.toolRow(rail, tool, frame));
-			shown++;
-		}
-		if (shown < total) {
-			lines.push(`${fg("dim", "│  ")} ${fg("muted", `… +${total - shown} more`)}`);
-		}
-		if (keepThinking && lines.length < maxLines) {
-			const tokenLabel = this.liveThinkingTokenLabel();
-			const previewLimit = Math.max(1, Math.min(50, width - GROUP_PADDING_X - 18 - tokenLabel.length));
-			lines.push(
-				`${fg("dim", "└  ")}${fg("muted", "·")} ${fg("thinkingText", `thinking: ${oneLine(tText, previewLimit)}`)} ${fg("muted", `· ${tokenLabel}`)}`,
-			);
-		}
-
-		if (this.hasPending() || this.liveThinkingActive()) scheduleAnimation();
+		const thinking = this.liveThinking();
+		const keepThinking = thinking.trim().length > 0 && (config.collapsedMaxLines > 2 || this.children.length === 0);
+		const working = this.hasPending() || this.liveThinkingActive() || (!this.sealed && this.children.length === 0);
+		const lines = [groupHeading(currentTheme, this.children, toolStatus, false, working, !!thinking.trim(), this.liveThinkingTokenLabel(), width)];
+		const shown = selectedTools(this.children, Math.max(1, config.collapsedMaxLines - 1 - (keepThinking ? 1 : 0)), toolStatus);
+		const column = nameColumn(shown, width, (tool) => tool.toolName);
+		shown.forEach((tool, index) => lines.push(this.toolRow(index === shown.length - 1 && !keepThinking ? "╰  " : "│  ", tool, width, column)));
+		if (keepThinking) lines.push(thinkingPreview(currentTheme, thinking, width));
+		if (working) scheduleAnimation();
 		return lines;
 	}
 
@@ -978,26 +991,17 @@ class ToolGroupComponent extends Container {
 	private renderExpanded(width: number): string[] {
 		const theme = currentTheme;
 		const fg = (color: string, text: string) => theme?.fg?.(color, text) ?? text;
-		const frame = SPINNER[Math.floor((Date.now() - spinnerStart) / SPINNER_MS) % SPINNER.length]!;
-		const lines: string[] = [];
-
-		const hasPendingTool = this.hasPending();
-		const isThinking = this.liveThinkingActive();
-		const openNoTools = !this.sealed && this.children.length === 0;
-		const working = hasPendingTool || isThinking || openNoTools;
-		const state = hasPendingTool ? "tool calling..." : isThinking || openNoTools ? "thinking..." : "tools done";
-		const stateColor = hasPendingTool ? "accent" : isThinking || openNoTools ? "thinkingText" : "success";
-		// Left icon: spinner while working, completion mark once the group is done.
-		const leftIcon = working ? frame : "✓";
-		lines.push(`${fg(stateColor, leftIcon)} ${fg(stateColor, state)}`);
-
+		const working = this.hasPending() || this.liveThinkingActive() || (!this.sealed && this.children.length === 0);
+		const hasThinking = !!this.liveThinking().trim();
+		const lines = [groupHeading(theme, this.children, toolStatus, true, working, hasThinking, this.liveThinkingTokenLabel(), width)];
+		const column = nameColumn(this.children, width, (tool) => tool.toolName);
 		const total = this.children.length;
 		for (let index = 0; index < total; index++) {
 			const tool = this.children[index];
-			const isLast = index === total - 1;
-			const rail = isLast ? "└─ " : "├─ ";
+			const isLast = index === total - 1 && !hasThinking;
+			const rail = isLast ? "╰  " : "├  ";
 			const sub = isLast ? "    " : "│   ";
-			lines.push(this.toolRow(rail, tool, frame));
+			lines.push(this.toolRow(rail, tool, width, column));
 			const result = toolResultText(tool);
 			if (result) {
 				const markdownWidth = Math.max(1, width - GROUP_PADDING_X - sub.length);
@@ -1020,7 +1024,7 @@ class ToolGroupComponent extends Container {
 		const tText = this.liveThinking().trim();
 		if (tText) {
 			lines.push(
-				`${fg("dim", "└  ")}${fg("muted", "·")} ${fg("thinkingText", "thinking")} ${fg("muted", `· ${this.liveThinkingTokenLabel()}`)}`,
+				`${fg("dim", "╰  ")}${fg("thinkingText", "思考")} ${fg("muted", `· ${this.liveThinkingTokenLabel()}`)}`,
 			);
 			const sub = "    ";
 			const markdownWidth = Math.max(1, width - GROUP_PADDING_X - sub.length);
@@ -1070,7 +1074,7 @@ class ToolGroupComponent extends Container {
 
 // =============================================================================
 // Animation scheduling. The TUI instance is captured via setWidget's factory
-// (extensions can't requestRender directly). We tick at 300ms and call the
+// (extensions can't requestRender directly). We tick at 100ms and call the
 // throttled requestRender(), so the diff renderer updates only the changed
 // spinner/elapsed cells — no full-screen repaint, no scroll fight.
 // =============================================================================
@@ -1364,12 +1368,7 @@ class TurnDividerComponent {
 	render(width: number): string[] {
 		const theme = currentTheme;
 		const fg = (color: string, text: string) => theme?.fg?.(color, text) ?? text;
-		const middle = `worked for ${this.timeLabel}`;
-		const avail = Math.max(6, width - middle.length - 2);
-		const left = Math.floor(avail / 2);
-		const right = avail - left;
-		const dash = (n: number) => "─".repeat(Math.max(0, n));
-		const line = `${fg("dim", dash(left))} ${fg("muted", middle)} ${fg("dim", dash(right))}`;
+		const line = `${fg("dim", "──")} ${fg("muted", `用时 ${this.timeLabel}`)}`;
 		return [truncateToWidth(line, Math.max(1, width))];
 	}
 
@@ -1695,9 +1694,12 @@ export default function (pi: ExtensionAPI) {
 	// shellCommandPrefix、图片缩放等设置。折叠组本就不渲染组内工具，原生渲染器只在
 	// 工具状态变化时运行一次（ToolGroupComponent 已不再级联 invalidate）。
 	let configWatcher: FSWatcher | undefined;
+	let reloadTimer: ReturnType<typeof setTimeout> | undefined;
 	let uiActive = false;
 
 	const stopConfigWatcher = () => {
+		if (reloadTimer) clearTimeout(reloadTimer);
+		reloadTimer = undefined;
 		configWatcher?.close();
 		configWatcher = undefined;
 	};
@@ -1723,7 +1725,6 @@ export default function (pi: ExtensionAPI) {
 		// 编辑器常用“写临时文件再改名”保存，文件级监听会在第一次保存后失效。
 		stopConfigWatcher();
 		try {
-			let reloadTimer: ReturnType<typeof setTimeout> | undefined;
 			configWatcher = watch(dirname(CONFIG_PATH), (_type, filename) => {
 				if (filename && String(filename) !== basename(CONFIG_PATH)) return;
 				if (reloadTimer) clearTimeout(reloadTimer);
@@ -1893,10 +1894,10 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("compact-ui-config", {
-		description: "Interactive compact-ui settings (arrows to select, Enter to adjust, Esc to close)",
+		description: "紧凑界面设置（方向键选择，Enter 调整，Esc 关闭）",
 		handler: async (_args, ctx) => {
 			// Non-TUI modes (print/json) can't show the interactive menu.
-			if (!ctx.hasUI) {
+			if (ctx.mode !== "tui") {
 				ctx.ui.notify(
 					`compact: collapsedMaxLines=${config.collapsedMaxLines}, expandedToolLines=${config.expandedToolLines}, expandedThinkingLines=${config.expandedThinkingLines}, nativeTools=${config.nativeTools.join(",")} (${CONFIG_PATH})`,
 					"info",
@@ -1942,10 +1943,10 @@ export default function (pi: ExtensionAPI) {
 		});
 
 		if (changed) {
-			ctx.ui.notify("compact-ui settings saved", "info");
+			ctx.ui.notify("紧凑界面设置已保存", "info");
 		}
 		// 名单是字符串列表，不适合步进器编辑；提示配置文件位置，保存后自动生效。
-		ctx.ui.notify(`Native tools (${config.nativeTools.length}): edit "nativeTools" in ${CONFIG_PATH}; changes apply on save`, "info");
+		ctx.ui.notify(`保留原生显示的工具：${config.nativeTools.length} 项。在 ${CONFIG_PATH} 编辑 nativeTools，保存即生效。`, "info");
 	},
 });
 }

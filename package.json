@@ -1,6 +1,6 @@
 {
   "name": "pi-compact-ui",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Compact tree-shaped reasoning and tool-call UI for the Pi Coding Agent (Aaalice233 fork: plugin compatibility, configurable native tools, long-session performance)",
   "type": "module",
   "keywords": [
@@ -30,7 +30,8 @@
   "scripts": {
     "check": "tsc --noEmit",
     "test": "node --no-warnings --import ./test/setup.ts --test test/*.test.ts",
-    "bench": "node --no-warnings --import ./test/setup.ts scripts/bench.ts"
+    "bench": "node --no-warnings --import ./test/setup.ts scripts/bench.ts",
+    "preview": "node --no-warnings --import ./test/setup.ts scripts/preview.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
