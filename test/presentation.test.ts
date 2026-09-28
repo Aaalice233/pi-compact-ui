@@ -43,10 +43,10 @@ test("中文、emoji、长工具名在极窄到宽屏都不溢出；耗时紧跟
 			assert.ok(component.render(width).every((line) => visibleWidth(line) <= width), `${width}/${expanded}`);
 		}
 	}
-	const timed = component.render(80).filter((line) => /\d\.\ds$/.test(line));
+	const timed = component.render(80).filter((line) => /\(\d\.\ds\)$/.test(line));
 	assert.equal(timed.length, 3);
-	assert.ok(timed.every((line) => /\S · \d\.\ds$/.test(line)));
-	assert.deepEqual(component.render(240).filter((line) => /\d\.\ds$/.test(line)), timed, "终端变宽不能拉开内容与耗时");
+	assert.ok(timed.every((line) => /\S \(\d\.\ds\)$/.test(line)));
+	assert.deepEqual(component.render(240).filter((line) => /\(\d\.\ds\)$/.test(line)), timed, "终端变宽不能拉开内容与耗时");
 });
 
 test("宽终端的标题 token 和工具耗时就近显示，不填充整行", () => {
@@ -59,8 +59,8 @@ test("宽终端的标题 token 和工具耗时就近显示，不填充整行", (
 	const component = new CompactExternalGroupComponent(state, plainTheme);
 	assert.deepEqual(component.render(240), [
 		" ▸ bash ×2",
-		" │  ✓ bash  pi --help 2>&1 | head -60 · 9.7s",
-		" ╰  ✓ bash  pi list 2>&1 · 5.0s",
+		" │  ✓ bash  pi --help 2>&1 | head -60 (9.7s)",
+		" ╰  ✓ bash  pi list 2>&1 (5.0s)",
 	]);
 	state.thinking = "检查帮助信息";
 	assert.equal(component.render(240)[0], " ▸ bash ×2 · 思考 1.2K");

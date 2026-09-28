@@ -8,7 +8,7 @@
  *
  * Collapsed (max 3 lines by default, configurable):
  *   ▸ bash ×1 · edit ×2 · read ×1 · 思考 1.2K
- *   │  ✗ bash  npm test · 断言失败 · 3.2s
+ *   │  ✗ bash  npm test · 断言失败 (3.2s)
  *   ╰  验证过期会话分支……
  *
  * Fullscreen header clicks toggle one group; Ctrl+O sets expansion globally via setExpanded.
@@ -434,8 +434,13 @@ function compactToolRow(theme: any, rail: string, name: string, args: any, statu
 		? width >= 64 ? `${oneLine(summary.content, 28)} · ${detail}` : detail
 		: summary.content;
 	const left = `${fg("dim", rail)}${fg(stateColor, icon)} ${fg("toolTitle", paddedTitle)}  ${fg(status === "error" ? "error" : "muted", payload)}`;
-	const metadata = [status !== "error" ? detail : "", elapsed].filter(Boolean).join(" · ");
-	return appendMetadata(left, metadata ? fg("dim", ` · ${metadata}`) : "", width - GROUP_PADDING_X);
+	// 缓存只保存计数文本，颜色在渲染时取主题，避免主题切换后保留旧色。
+	const diff = status !== "error" ? /^\+(\d+) [−-](\d+)$/.exec(detail) : null;
+	const detailText = status === "error" ? "" : diff
+		? `${fg("toolDiffAdded", `+${diff[1]}`)} ${fg("toolDiffRemoved", `−${diff[2]}`)}`
+		: detail ? fg("dim", detail) : "";
+	const metadata = [detailText, elapsed ? fg("dim", `(${elapsed})`) : ""].filter(Boolean).join(" ");
+	return appendMetadata(left, metadata ? ` ${metadata}` : "", width - GROUP_PADDING_X);
 }
 
 const resultSummaryCache = new WeakMap<object, string>();

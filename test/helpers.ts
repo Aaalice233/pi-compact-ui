@@ -15,7 +15,7 @@ export const plainTheme = {
 };
 
 /** 最小 ExtensionAPI 替身：记录事件处理器、命令与工具注册。 */
-export function createFakePi() {
+export function createFakePi(theme = plainTheme) {
 	const handlers = new Map<string, Handler[]>();
 	const tools: string[] = [];
 	const renders = { count: 0 };
@@ -34,7 +34,7 @@ export function createFakePi() {
 		mode,
 		hasUI: mode === "tui",
 		ui: {
-			theme: plainTheme,
+			theme,
 			setHiddenThinkingLabel() {},
 			setWidget(_key: string, factory: unknown) {
 				if (typeof factory === "function") factory(tui);
