@@ -31,6 +31,15 @@ describe("配置解析", () => {
 		const config = resolveConfig(undefined);
 		assert.deepEqual(config.nativeTools, [...DEFAULT_NATIVE_TOOLS]);
 		assert.equal(config.expandedThinkingLines, 10);
+		assert.equal(config.rowMaxWidth, 100, "行宽上限有默认值，不跟随终端宽度");
+	});
+
+	test("数值选项规整到范围内，类型不对则回退默认值", () => {
+		assert.equal(resolveConfig({ rowMaxWidth: 1e9 }).rowMaxWidth, 200);
+		assert.equal(resolveConfig({ rowMaxWidth: 1 }).rowMaxWidth, 40);
+		assert.equal(resolveConfig({ rowMaxWidth: 96.7 }).rowMaxWidth, 96);
+		assert.equal(resolveConfig({ rowMaxWidth: "wide" }).rowMaxWidth, 100);
+		assert.equal(resolveConfig({ rowMaxWidth: Number.NaN }).rowMaxWidth, 100);
 	});
 
 	test("nativeTools 整体替换默认值，非法项被丢弃", () => {

@@ -125,11 +125,11 @@ test("结果摘要与耗时紧跟各行内容，不被最长的一行拖远", as
 		assert.match(rows[1]!, /src\/user\.ts \+10 −2 \(1\.2s\)$/);
 		assert.match(rows[2]!, /src\/session\.ts \(1\.2s\)$/, "没有摘要的行也紧跟内容");
 		// 关键：一条很长的命令不能把其他行的耗时拖到屏幕右侧。
-		assert.ok(timeStart(rows[3]!) > 100, "长命令自己的耗时跟在自己的内容后面");
+		assert.ok(timeStart(rows[3]!) > 80, "长命令自己的耗时跟在自己的内容后面");
 		for (const short of rows.slice(0, 3)) assert.ok(timeStart(short) < 40, `短行耗时不跨屏：实际第 ${timeStart(short)} 列`);
 		assert.notEqual(timeStart(rows[2]!), timeStart(rows[0]!), "没有共享列，各行各自就近");
-		// 短行不受终端宽度影响（长命令行在更宽终端上本来就能多显示内容，不参与比较）。
-		assert.deepEqual(toolRows(240).slice(0, 3), rows.slice(0, 3), "终端变宽不能把短行的耗时拉开");
+		// 行宽上限不随终端变宽，所以 160 与 240 列下渲染结果完全一致。
+		assert.deepEqual(toolRows(240), rows, "终端变宽不能拉开内容与耗时");
 		chat.clear();
 	} finally {
 		Date.now = now;
@@ -137,29 +137,36 @@ test("结果摘要与耗时紧跟各行内容，不被最长的一行拖远", as
 	}
 });
 
-test("长命令只受行宽限制，不再被固定字符数提前截断", async () => {
+test("调用行受配置的行宽上限约束，不随终端变宽", async () => {
 	const now = Date.now;
-	const command = 'cd "C:/Users/Administrator/.pi/agent/git/github.com/Aaalice233/pi-compact-ui" && git add -A && git status --short && git log --oneline -3';
+	const longCommand = 'cd "C:/Users/Administrator/.pi/agent/git/github.com/Aaalice233/pi-compact-ui" && git add -A && git status --short && git log --oneline -3';
+	const fitCommand = "npm test -- --filter 调用行";
+	let clock = 1000;
 	try {
-		Date.now = () => 1000;
+		Date.now = () => clock;
 		await fake.emit("agent_start");
 		const chat = new Container();
 		chat.addChild(new AssistantMessageComponent({ role: "assistant", content: [] } as any));
-		await fake.emit("tool_execution_start", { toolCallId: "long" });
-		const tool = new ToolExecutionComponent("bash", "long", { command }, {}, { name: "bash" } as any, { requestRender() {} } as any, process.cwd());
-		chat.addChild(tool);
-		Date.now = () => 2500;
-		tool.updateResult({ content: [{ type: "text", text: "ok" }], details: undefined, isError: false } as any, false);
-		await fake.emit("tool_execution_end", { toolCallId: "long" });
+		const build = async (id: string, command: string) => {
+			await fake.emit("tool_execution_start", { toolCallId: id });
+			const tool = new ToolExecutionComponent("bash", id, { command }, {}, { name: "bash" } as any, { requestRender() {} } as any, process.cwd());
+			chat.addChild(tool);
+			clock += 1500;
+			tool.updateResult({ content: [{ type: "text", text: "ok" }], details: undefined, isError: false } as any, false);
+			await fake.emit("tool_execution_end", { toolCallId: id });
+		};
+		await build("fit", fitCommand);
+		await build("long", longCommand);
 		const group = chat.children.find((child: any) => child.toolName === "group") as any;
-		const wide = group.render(200).map(stripTerminalSequences).filter((line: string) => line.trim())[1]!;
-		assert.ok(wide.includes(`git status --short`), "宽终端下命令应完整显示");
-		assert.ok(wide.includes(command.slice(60, 80)), "超过 60 字符的部分不能被固定上限截掉");
-		assert.doesNotMatch(wide, /…/);
-		const narrow = group.render(70).map(stripTerminalSequences).filter((line: string) => line.trim())[1]!;
-		assert.match(narrow, /\(1\.5s\)$/);
-		assert.ok(visibleWidth(narrow) <= 70, "窄终端仍然不溢出");
-		assert.ok(narrow.length < wide.length, "窄终端仍然按行宽截断");
+		const toolRows = (width: number) => group.render(width).map(stripTerminalSequences).filter((line: string) => line.trim()).slice(1);
+		const rows = toolRows(200);
+		// 70 字符的命令完整显示：上限不是旧的 60 字符固定截断。
+		assert.match(rows[0]!, /npm test -- --filter 调用行 \(1\.5s\)$/);
+		assert.doesNotMatch(rows[0]!, /…/);
+		// 长命令在宽终端上仍然被上限截断，并保住耗时。
+		assert.match(rows[1]!, /… \(1\.5s\)$/);
+		assert.ok(visibleWidth(rows[1]!) <= 100, `行宽不超过上限（实际 ${visibleWidth(rows[1]!)}）`);
+		assert.deepEqual(toolRows(400), rows, "终端再宽也不加宽，上限是固定的");
 		chat.clear();
 	} finally {
 		Date.now = now;

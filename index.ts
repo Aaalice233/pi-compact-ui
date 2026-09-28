@@ -70,11 +70,17 @@ export const DEFAULT_NATIVE_TOOLS = [
 
 type CompactConfig = {
 	expandedThinkingLines: number;
+	/**
+	 * 单个调用行的最大列数。不跟随终端宽度，否则一条超长命令会把整块顶到屏幕边缘，
+	 * 同组其他行的数字也要跨过整屏去读。
+	 */
+	rowMaxWidth: number;
 	nativeTools: string[];
 };
 
 const DEFAULT_CONFIG: CompactConfig = {
 	expandedThinkingLines: 10,
+	rowMaxWidth: 100,
 	nativeTools: [...DEFAULT_NATIVE_TOOLS],
 };
 
@@ -84,7 +90,7 @@ const DEFAULT_CONFIG: CompactConfig = {
  */
 export function resolveConfig(raw: unknown): CompactConfig {
 	const source = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
-	const numberOr = (key: "expandedThinkingLines") => {
+	const numberOr = (key: "expandedThinkingLines" | "rowMaxWidth") => {
 		const value = source[key];
 		const meta = CONFIG_KEYS.find((item) => item.id === key)!;
 		return typeof value === "number" && Number.isFinite(value)
@@ -95,6 +101,7 @@ export function resolveConfig(raw: unknown): CompactConfig {
 		: [...DEFAULT_CONFIG.nativeTools];
 	return {
 		expandedThinkingLines: numberOr("expandedThinkingLines"),
+		rowMaxWidth: numberOr("rowMaxWidth"),
 		nativeTools,
 	};
 }
@@ -148,6 +155,14 @@ const CONFIG_KEYS = [
 		min: 1,
 		max: 100,
 		step: 1,
+	},
+	{
+		id: "rowMaxWidth",
+		label: "调用行宽度",
+		description: "单个调用行的最大列数（不随终端变宽）",
+		min: 40,
+		max: 200,
+		step: 4,
 	},
 ] as const;
 
@@ -1091,20 +1106,23 @@ class ToolGroupComponent extends Container {
 	render(width: number): string[] {
 		// 封存后不再自动展开；新一轮的块由新组件实例负责。
 		if (this.sealed) this.collapsedWhileOpen = false;
+		// 调用行不跟随终端变宽：一条超长命令会把整块顶到屏幕边缘，同组其他行的数字
+		// 也要跨过整屏去读。上限可用配置调整，但永远不超出实际可用宽度。
+		const limit = Math.max(1, Math.min(width, config.rowMaxWidth));
 		// 转圈或实时思考中的组每帧都在变（动画帧、耗时、流式思考），不缓存；
 		// 其余状态只在下列 key 或 markDirty() 覆盖的事件中变化。
 		const animating = this.needsAnimation();
 		const expanded = this._expanded || this.autoExpanded();
 		const key = animating
 			? ""
-			: `${width}|${expanded ? 1 : 0}|${this.anchored ? 1 : 0}|${this.sealed ? 1 : 0}|${this === lastActiveGroup ? 1 : 0}|${this.children.length}|${this.children.map(toolStatus).join(",")}`;
+			: `${limit}|${expanded ? 1 : 0}|${this.anchored ? 1 : 0}|${this.sealed ? 1 : 0}|${this === lastActiveGroup ? 1 : 0}|${this.children.length}|${this.children.map(toolStatus).join(",")}`;
 		if (!animating && this.lineCache?.key === key) return this.lineCache.lines;
 
-		const lines = expanded ? this.renderExpanded(width) : this.renderCollapsed(width);
+		const lines = expanded ? this.renderExpanded(limit) : this.renderCollapsed(limit);
 		// Indent compact blocks from the transcript edge while keeping every line
 		// within the terminal width (including mobile / narrow terminals).
-		const padding = " ".repeat(Math.min(GROUP_PADDING_X, Math.max(0, width - 1)));
-		const contentWidth = Math.max(1, width - padding.length);
+		const padding = " ".repeat(Math.min(GROUP_PADDING_X, Math.max(0, limit - 1)));
+		const contentWidth = Math.max(1, limit - padding.length);
 		const rendered = lines.map((line) => padding + truncateToWidth(line, contentWidth, "…"));
 		// Native ToolExecutionComponent starts with Spacer(1). Our custom render
 		// bypasses that child tree, so restore the same single leading gap while
