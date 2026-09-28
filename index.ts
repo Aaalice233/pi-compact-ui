@@ -211,8 +211,8 @@ const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", 
 // 100ms/frame (10fps) matches pi's default spinner cadence; 300ms felt laggy.
 const SPINNER_MS = 100;
 const GROUP_PADDING_X = 1;
-/** 低于这个宽度就不显示耗时列：正文比“用了多久”重要。 */
-const MIN_TIMED_ROW_WIDTH = 36;
+/** 低于这个宽度就不显示右列元数据（结果摘要与耗时）：正文比数字重要。 */
+const MIN_META_WIDTH = 36;
 const spinnerStart = Date.now();
 const PARENT_KEY = Symbol.for("compact-ui.group-parent");
 const PATCH_KEY = Symbol.for("compact-ui.group-patch");
@@ -439,29 +439,18 @@ function toolRowParts(theme: any, rail: string, name: string, args: any, status:
 }
 
 /**
- * 组装一组行：右列（结果摘要 + 耗时）跨行对齐，列位置由最宽的一行决定，不贴终端最右。
- * 窄屏（或没有右列内容）时只留行主体，优先保住工具与错误正文。
+ * 拼一行：行主体 + 右列元数据（结果摘要、耗时）。
+ * 元数据紧跟本行内容，不做跨行对齐：共享列会被本组最长的一行顶到屏幕最右，
+ * 短行的数字就要跨过整屏去读。宽终端下也不会因此把数字拉远。
  */
-function layoutToolRows(theme: any, rows: ToolRowParts[], available: number): string[] {
+function joinToolRow(theme: any, row: ToolRowParts, available: number): string {
 	const width = Math.max(1, available);
-	const metricWidth = rows.reduce((max, row) => Math.max(max, visibleWidth(row.metric)), 0);
-	const timeWidth = rows.reduce((max, row) => Math.max(max, visibleWidth(row.elapsed)), 0);
-	// 没有耗时可显示时（历史调用、不足 0.1s），结果摘要仍要右对齐成列，不能一起消失。
-	const metaWidth = metricWidth + (metricWidth && timeWidth ? 1 : 0) + timeWidth;
-	if (!metaWidth || width < MIN_TIMED_ROW_WIDTH) return rows.map((row) => truncateToWidth(row.content, width, "…"));
-	const widest = rows.reduce((max, row) => Math.max(max, visibleWidth(row.content)), 0);
-	const column = Math.max(1, Math.min(widest + 1, width - metaWidth - 1));
-	const fg = (color: string, value: string) => theme?.fg?.(color, value) ?? value;
-	const padLeft = (text: string, target: number) => " ".repeat(Math.max(0, target - visibleWidth(text))) + text;
-	return rows.map((row) => {
-		const body = truncateToWidth(row.content, column, "…");
-		const gap = " ".repeat(Math.max(1, column - visibleWidth(body)));
-		const metric = row.metric ? padLeft(row.metric, metricWidth) : "";
-		const time = row.elapsed ? fg("dim", padLeft(row.elapsed, timeWidth)) : "";
-		// 只有摘要而没有耗时的行尾不再补空列，避免行尾空白。
-		const meta = time ? `${metric || " ".repeat(metricWidth)}${metricWidth ? " " : ""}${time}` : metric;
-		return meta ? `${body}${gap}${meta}` : body;
-	});
+	// 耗时紧跟正文，加括号才能和内容分开；结果摘要用自己的简写形式（+1 −2 / 12–40 行）。
+	const time = row.elapsed ? theme?.fg?.("dim", `(${row.elapsed})`) ?? `(${row.elapsed})` : "";
+	const meta = [row.metric, time].filter(Boolean).join(" ");
+	if (!meta || width < MIN_META_WIDTH) return truncateToWidth(row.content, width, "…");
+	// 正文可以让位，元数据不能被截掉：数字比被截了一半的内容更难找回。
+	return `${truncateToWidth(row.content, Math.max(1, width - visibleWidth(meta) - 1), "…")} ${meta}`;
 }
 
 const resultSummaryCache = new WeakMap<object, string>();
@@ -657,13 +646,14 @@ export class CompactExternalGroupComponent implements Component {
 		return oneLine(tool.resultText.slice(0, 4096).split("\n").find((line) => line.trim()), 100) || "执行失败";
 	}
 
-	/** 行主体先全部算完再统一排版，右列（结果摘要 + 耗时）才能对齐到同一列。 */
+	/** 行主体先全部算完再排版：右列元数据紧跟各行自身内容，不跨行对齐。 */
 	private toolLines(rows: Array<{ rail: string; tool: CompactExternalTool }>, width: number): string[] {
 		const column = nameColumn(rows.map((row) => row.tool), width, (tool) => tool.name);
-		return layoutToolRows(this.theme, rows.map((row) => ({
+		const available = Math.max(1, width - GROUP_PADDING_X);
+		return rows.map((row) => joinToolRow(this.theme, {
 			...toolRowParts(this.theme, row.rail, row.tool.name, row.tool.args, row.tool.status, this.detail(row.tool), width, column),
 			elapsed: this.elapsed(row.tool),
-		})), Math.max(1, width - GROUP_PADDING_X));
+		}, available));
 	}
 
 	private tokenLabel(): string {
@@ -1029,11 +1019,12 @@ class ToolGroupComponent extends Container {
 
 	private toolLines(rows: Array<{ rail: string; tool: any }>, width: number): string[] {
 		const column = nameColumn(rows.map((row) => row.tool), width, (tool) => tool.toolName);
-		// 历史工具没有原始计时，elapsed 为空串，不影响右列列宽。
-		return layoutToolRows(currentTheme, rows.map((row) => ({
+		const available = Math.max(1, width - GROUP_PADDING_X);
+		// 历史工具没有原始计时，elapsed 为空串，不影响其他行的排版。
+		return rows.map((row) => joinToolRow(currentTheme, {
 			...toolRowParts(currentTheme, row.rail, row.tool.toolName, row.tool.args, toolStatus(row.tool), resultSummary(row.tool), width, column),
 			elapsed: toolElapsed(row.tool),
-		})), Math.max(1, width - GROUP_PADDING_X));
+		}, available));
 	}
 	// Live state only applies to the not-yet-sealed (active) block.
 	private liveThinking(): string {

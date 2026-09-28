@@ -112,11 +112,11 @@ test("同名工具调用 ID 也不能让子会话覆盖主会话计时", async (
 		Date.now = () => 9000;
 		await h.child.emit("tool_execution_start", { toolCallId: "shared-call-id" }, "print");
 		Date.now = () => 10000;
-		assert.match(plain(h.group), /9\.0s$/);
+		assert.match(plain(h.group), /\(9\.0s\)$/);
 		await h.child.emit("tool_execution_end", { toolCallId: "shared-call-id" }, "print");
 		assert.equal(h.tool._groupEndAt, undefined);
 		Date.now = () => 11000;
-		assert.match(plain(h.group), /10\.0s$/);
+		assert.match(plain(h.group), /\(10\.0s\)$/);
 	} finally { Date.now = now; await h.cleanup(); }
 });
 

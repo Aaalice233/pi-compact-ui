@@ -124,7 +124,7 @@ test("手动收起约束整个未封存的块，封存后的新块重新自动�
 	await fake.emit("agent_end"); chat.clear();
 });
 
-test("中文、emoji、长工具名在极窄到宽屏都不溢出；耗时成列且不贴右边缘", () => {
+test("中文、emoji、长工具名在极窄到宽屏都不溢出；耗时紧跟内容不贴右边缘", () => {
 	const state = fixture();
 	state.tools[0]!.name = "mcp__长工具名称😀_超长后缀";
 	const component = new CompactExternalGroupComponent(state, plainTheme);
@@ -135,16 +135,16 @@ test("中文、emoji、长工具名在极窄到宽屏都不溢出；耗时成列
 		}
 	}
 	component.setExpanded(true);
-	const timed = component.render(80).filter((line) => /\d\.\ds$/.test(line));
+	const timed = component.render(80).filter((line) => /\(\d\.\ds\)$/.test(line));
 	assert.equal(timed.length, 3);
-	// 组内耗时右对齐到同一列，且由最宽的一行决定位置，不随终端宽度滑到最右。
-	const starts = timed.map((line) => visibleWidth(line.slice(0, /\d\.\ds$/.exec(line)!.index)));
-	assert.equal(new Set(starts).size, 1, "同一组里的耗时必须对齐");
-	assert.ok(starts[0]! < 76, `耗时列不能贴到终端右边缘（实际第 ${starts[0]} 列）`);
-	assert.deepEqual(component.render(240).filter((line) => /\d\.\ds$/.test(line)), timed, "终端变宽不能拉开内容与耗时");
+	// 耗时紧跟各自内容：列位各不相同，且都离终端右边缘很远；宽终端也不会把它们拉开。
+	const starts = timed.map((line) => visibleWidth(line.slice(0, /\(\d\.\ds\)$/.exec(line)!.index)));
+	assert.equal(new Set(starts).size, starts.length, "各行耗时各自就近，不做跳行对齐");
+	assert.ok(starts.every((start) => start < 70), `耗时不贴右边缘（${starts.join("/")}）`);
+	assert.deepEqual(component.render(240).filter((line) => /\(\d\.\ds\)$/.test(line)), timed, "终端变宽不能拉开内容与耗时");
 });
 
-test("宽终端的时间列紧跟最宽行，标题不再堆辅助信息", () => {
+test("宽终端下耗时紧跟内容，不填充整行", () => {
 	const state = fixture();
 	state.tools = [
 		{ id: "1", name: "bash", args: { command: "pi --help 2>&1 | head -60" }, status: "success", resultText: "", startedAt: 0, endedAt: 9700 },
@@ -156,8 +156,8 @@ test("宽终端的时间列紧跟最宽行，标题不再堆辅助信息", () =>
 	component.setExpanded(true);
 	assert.deepEqual(component.render(240), [
 		" ▾ bash×2",
-		" │  ✓ bash  pi --help 2>&1 | head -60 9.7s",
-		" ╰  ✓ bash  pi list 2>&1              5.0s",
+		" │  ✓ bash  pi --help 2>&1 | head -60 (9.7s)",
+		" ╰  ✓ bash  pi list 2>&1 (5.0s)",
 	]);
 	state.thinking = "检查帮助信息";
 	assert.equal(component.render(240)[0], " ▾ bash×2");

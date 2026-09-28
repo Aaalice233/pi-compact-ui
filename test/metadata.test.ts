@@ -57,7 +57,7 @@ test("折叠标题的失败计数用主题灰色，红色只留给展开后的 �
 	} finally { chat.clear(); }
 });
 
-test("毫秒级调用不显示 0.0s，也不占用同组的耗时列", async () => {
+test("毫秒级调用不显示 0.0s，也不影响其他行的排版", async () => {
 	const now = Date.now;
 	try {
 		Date.now = () => 5000;
@@ -81,7 +81,7 @@ test("毫秒级调用不显示 0.0s，也不占用同组的耗时列", async () 
 		group.setExpanded(true);
 		const lines = group.render(100).map(stripTerminalSequences).filter((line: string) => line.trim());
 		assert.match(lines[1]!, /instant\.ts$/, "不足 0.1s 不显示耗时");
-		assert.match(lines[2]!, /slow\.ts\s+1\.2s$/, "能计时的调用仍右对齐到同一列");
+		assert.match(lines[2]!, /slow\.ts \(1\.2s\)$/, "能计时的调用在正文后括注耗时");
 		chat.clear();
 	} finally {
 		Date.now = now;
@@ -89,39 +89,47 @@ test("毫秒级调用不显示 0.0s，也不占用同组的耗时列", async () 
 	}
 });
 
-test("结果摘要与耗时共用右列，跨行对齐且不贴正文", async () => {
+test("结果摘要与耗时紧跟各行内容，不被最长的一行拖远", async () => {
 	const now = Date.now;
+	const longCommand = `pwsh -NoProfile -Command '$ErrorActionPreference = "Stop"; Get-Location; git status --short; Get-CimInstance Win32_Process | Select-Object -First 5'`;
 	try {
 		Date.now = () => 1000;
 		await fake.emit("agent_start");
 		const chat = new Container();
 		chat.addChild(new AssistantMessageComponent({ role: "assistant", content: [] } as any));
-		const build = (name: string, id: string, path: string) => {
-			const component = new ToolExecutionComponent(name, id, { path }, {}, { name } as any, { requestRender() {} } as any, process.cwd());
+		const build = (name: string, id: string, args: any) => {
+			const component = new ToolExecutionComponent(name, id, args, {}, { name } as any, { requestRender() {} } as any, process.cwd());
 			chat.addChild(component);
 			return component;
 		};
-		await fake.emit("tool_execution_start", { toolCallId: "edit-a" });
-		const edit = build("edit", "edit-a", "src/auth.ts");
-		await fake.emit("tool_execution_start", { toolCallId: "edit-b" });
-		const narrow = build("edit", "edit-b", "src/user.ts");
-		await fake.emit("tool_execution_start", { toolCallId: "read-a" });
-		const read = build("read", "read-a", "src/session.ts");
+		const ids = ["edit-a", "edit-b", "read-a", "bash-long"];
+		await fake.emit("tool_execution_start", { toolCallId: ids[0] });
+		const edit = build("edit", ids[0]!, { path: "src/auth.ts" });
+		await fake.emit("tool_execution_start", { toolCallId: ids[1] });
+		const wide = build("edit", ids[1]!, { path: "src/user.ts" });
+		await fake.emit("tool_execution_start", { toolCallId: ids[2] });
+		const read = build("read", ids[2]!, { path: "src/session.ts" });
+		await fake.emit("tool_execution_start", { toolCallId: ids[3] });
+		const long = build("bash", ids[3]!, { command: longCommand });
 		Date.now = () => 2200;
 		edit.updateResult({ content: [{ type: "text", text: "ok" }], details: { diff: "@@ -1,1 +1,1 @@\n-old\n+new\n" }, isError: false } as any, false);
-		narrow.updateResult({ content: [{ type: "text", text: "ok" }], details: { diff: `@@ -1,2 +1,10 @@\n${"+added\n".repeat(10)}${"-gone\n".repeat(2)}` }, isError: false } as any, false);
+		wide.updateResult({ content: [{ type: "text", text: "ok" }], details: { diff: `@@ -1,2 +1,10 @@\n${"+added\n".repeat(10)}${"-gone\n".repeat(2)}` }, isError: false } as any, false);
 		read.updateResult({ content: [{ type: "text", text: "ok" }], details: undefined, isError: false } as any, false);
-		for (const id of ["edit-a", "edit-b", "read-a"]) await fake.emit("tool_execution_end", { toolCallId: id });
+		long.updateResult({ content: [{ type: "text", text: "ok" }], details: undefined, isError: false } as any, false);
+		for (const id of ids) await fake.emit("tool_execution_end", { toolCallId: id });
 		const group = chat.children.find((child: any) => child.toolName === "group") as any;
 		const toolRows = (width: number) => group.render(width).map(stripTerminalSequences).filter((line: string) => line.trim()).slice(1);
 		const rows = toolRows(160);
 		const timeStart = (row: string) => visibleWidth(row.slice(0, row.lastIndexOf(" ") + 1));
-		assert.match(rows[0]!, /src\/auth\.ts\s+\+1 −1 1\.2s$/, "增减紧接耗时，同处右列");
-		assert.match(rows[1]!, /src\/user\.ts\s+\+10 −2 1\.2s$/, "较宽的增减右对齐后与耗时同列");
-		assert.match(rows[2]!, /src\/session\.ts\s+1\.2s$/, "没有摘要的行只显示耗时");
-		assert.equal(new Set(rows.map(timeStart)).size, 1, "三行耗时在同一列");
-		assert.ok(timeStart(rows[0]!) < 60, `右列不能贴到终端右边缘（实际第 ${timeStart(rows[0]!)} 列）`);
-		assert.deepEqual(toolRows(240), rows, "终端变宽不能把右列拉到远端");
+		assert.match(rows[0]!, /src\/auth\.ts \+1 −1 \(1\.2s\)$/, "增减与耗时都紧跟内容");
+		assert.match(rows[1]!, /src\/user\.ts \+10 −2 \(1\.2s\)$/);
+		assert.match(rows[2]!, /src\/session\.ts \(1\.2s\)$/, "没有摘要的行也紧跟内容");
+		// 关键：一条很长的命令不能把其他行的耗时拖到屏幕右侧。
+		assert.ok(timeStart(rows[3]!) > 100, "长命令自己的耗时跟在自己的内容后面");
+		for (const short of rows.slice(0, 3)) assert.ok(timeStart(short) < 40, `短行耗时不跨屏：实际第 ${timeStart(short)} 列`);
+		assert.notEqual(timeStart(rows[2]!), timeStart(rows[0]!), "没有共享列，各行各自就近");
+		// 短行不受终端宽度影响（长命令行在更宽终端上本来就能多显示内容，不参与比较）。
+		assert.deepEqual(toolRows(240).slice(0, 3), rows.slice(0, 3), "终端变宽不能把短行的耗时拉开");
 		chat.clear();
 	} finally {
 		Date.now = now;
@@ -149,7 +157,7 @@ test("长命令只受行宽限制，不再被固定字符数提前截断", async
 		assert.ok(wide.includes(command.slice(60, 80)), "超过 60 字符的部分不能被固定上限截掉");
 		assert.doesNotMatch(wide, /…/);
 		const narrow = group.render(70).map(stripTerminalSequences).filter((line: string) => line.trim())[1]!;
-		assert.match(narrow, /1\.5s$/);
+		assert.match(narrow, /\(1\.5s\)$/);
 		assert.ok(visibleWidth(narrow) <= 70, "窄终端仍然不溢出");
 		assert.ok(narrow.length < wide.length, "窄终端仍然按行宽截断");
 		chat.clear();
