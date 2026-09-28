@@ -7,11 +7,11 @@
  * merged into the same block.
  *
  * Collapsed (max 3 lines by default, configurable):
- *   ▸ 3 个工具 · 1 失败 · 思考 1.2K
+ *   ▸ bash ×1 · edit ×2 · read ×1 · 思考 1.2K
  *   │  ✗ bash  npm test · 断言失败 · 3.2s
  *   ╰  验证过期会话分支……
  *
- * Ctrl+O toggles collapse/expand (via setExpanded, same as built-in tools).
+ * Fullscreen header clicks toggle one group; Ctrl+O sets expansion globally via setExpanded.
  * Expand line counts are configurable via /compact-ui-config (interactive
  * settings menu, arrows to select, Enter to adjust, Esc to close). All
  * settings live in ~/.pi/agent/compact-ui.json and apply on save:
@@ -41,7 +41,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
-import type { Component, DefaultTextStyle, MarkdownTheme, SettingItem } from "@earendil-works/pi-tui";
+import type { Component, DefaultTextStyle, MarkdownTheme, SettingItem, TuiMouseEvent } from "@earendil-works/pi-tui";
 import { existsSync, readFileSync, watch, writeFileSync, type FSWatcher } from "fs";
 import { homedir } from "os";
 import { basename, dirname, join } from "path";
@@ -376,11 +376,39 @@ function groupHeading(theme: any, tools: any[], status: (tool: any) => ToolStatu
 	const failed = tools.filter((tool) => status(tool) === "error").length;
 	const pending = tools.filter((tool) => status(tool) === "pending").length;
 	const frame = SPINNER[Math.floor((Date.now() - spinnerStart) / SPINNER_MS) % SPINNER.length]!;
-	const label = tools.length ? `${tools.length} 个工具` : working ? "正在思考" : "思考记录";
-	const detail = failed ? fg("error", ` · ${failed} 失败`) : pending ? fg("accent", ` · ${pending} 运行中`) : "";
-	const icon = working ? fg("accent", frame) : fg("muted", expanded ? "▾" : "▸");
-	const title = `${icon} ${fg(working ? "accent" : "muted", label)}${detail}`;
-	return appendMetadata(title, thinking ? fg("dim", ` · 思考 ${tokens}`) : "", width - GROUP_PADDING_X);
+	// 按首次调用顺序汇总，流式追加同类调用只改数量，不让工具名来回换位置。
+	const counts = new Map<string, number>();
+	for (const tool of tools) {
+		const name = String(tool.toolName ?? tool.name ?? "tool");
+		counts.set(name, (counts.get(name) ?? 0) + 1);
+	}
+	const label = tools.length
+		? [...counts].map(([name, count]) => `${oneLine(name, 24)} ×${count}`).join(" · ")
+		: working ? "正在思考" : "思考记录";
+	const detail = (failed ? fg("error", ` · ${failed} 失败`) : "") + (pending ? fg("accent", ` · ${pending} 运行中`) : "");
+	const icon = fg("muted", expanded ? "▾" : "▸") + (working ? ` ${fg("accent", frame)}` : "");
+	const available = Math.max(1, width - GROUP_PADDING_X);
+	const usage = thinking ? fg("dim", ` · 思考 ${tokens}`) : "";
+	// 窄屏先省略 token，再裁剪工具摘要；不能把失败/运行状态裁成无意义的「1 …」。
+	const suffix = detail + (visibleWidth(`${icon} ${label}${detail}${usage}`) <= available ? usage : "");
+	const title = truncateToWidth(label, Math.max(1, available - visibleWidth(`${icon} ${suffix}`)), "…");
+	return truncateToWidth(`${icon} ${fg(working ? "accent" : "muted", title)}${suffix}`, available, "…");
+}
+
+/**
+ * 只响应标题文字区域的单击。press/drag/wheel 留给 Pi，以保留拖选、滚动与编辑器焦点。
+ * Container 子类须返回具体 target，不能沿隐藏的原生工具 children 分发鼠标事件。
+ */
+function clickGroupHeader(component: Component, event: TuiMouseEvent, row: number, columns: number,
+	toggle: () => void): ReturnType<Container["handleMouse"]> {
+	if (event.type !== "click" || event.button !== "left" || (event.clickCount ?? 1) !== 1 ||
+		event.shift || event.alt || event.ctrl || event.y !== row || event.y >= event.height ||
+		event.x < Math.min(GROUP_PADDING_X, Math.max(0, event.width - 1)) || event.x >= Math.min(columns, event.width)) return undefined;
+	toggle();
+	return {
+		handled: true, render: true,
+		target: { component, originX: event.screenX - event.x, originY: event.screenY - event.y, width: event.width, height: event.height },
+	};
 }
 
 function selectedTools<T>(tools: T[], limit: number, status: (tool: T) => ToolStatus): T[] {
@@ -573,6 +601,7 @@ export type CompactExternalGroup = {
  */
 export class CompactExternalGroupComponent implements Component {
 	private expanded = false;
+	private headerColumns = 0;
 	readonly state: CompactExternalGroup;
 	private readonly theme: any;
 
@@ -584,6 +613,10 @@ export class CompactExternalGroupComponent implements Component {
 
 	setExpanded(expanded: boolean): void {
 		this.expanded = expanded;
+	}
+
+	handleMouse(event: TuiMouseEvent): ReturnType<Container["handleMouse"]> {
+		return clickGroupHeader(this, event, 0, this.headerColumns, () => this.setExpanded(!this.expanded));
 	}
 
 	invalidate(): void {}
@@ -677,7 +710,9 @@ export class CompactExternalGroupComponent implements Component {
 		const source = this.expanded ? this.renderExpanded(width) : this.renderCollapsed(width);
 		const padding = " ".repeat(Math.min(GROUP_PADDING_X, Math.max(0, width - 1)));
 		const contentWidth = Math.max(1, width - padding.length);
-		return source.map((line) => padding + truncateToWidth(line, contentWidth, "…"));
+		const lines = source.map((line) => padding + truncateToWidth(line, contentWidth, "…"));
+		this.headerColumns = visibleWidth(lines[0] ?? "");
+		return lines;
 	}
 }
 
@@ -864,6 +899,7 @@ class ToolGroupComponent extends Container {
 	 * 其余变化（主题、配置、思考快照）经 markDirty()/invalidate() 清除。
 	 */
 	private lineCache: { key: string; lines: string[] } | undefined;
+	private headerColumns = 0;
 
 	constructor() {
 		super();
@@ -874,6 +910,10 @@ class ToolGroupComponent extends Container {
 		// 长会话里按一次 Ctrl+O 就要重算数百个 diff/高亮。
 		this._expanded = expanded;
 		this.markDirty();
+	}
+
+	handleMouse(event: TuiMouseEvent): ReturnType<Container["handleMouse"]> {
+		return clickGroupHeader(this, event, this.anchored ? 0 : 1, this.headerColumns, () => this.setExpanded(!this._expanded));
 	}
 
 	addTool(tool: any): void {
@@ -1065,6 +1105,7 @@ class ToolGroupComponent extends Container {
 		// bypasses that child tree, so restore the same single leading gap while
 		// the group is top-level. Anchored groups receive deterministic spacing
 		// from placeAnchoredGroupBeforeText() instead.
+		this.headerColumns = visibleWidth(rendered[0] ?? "");
 		const result = this.anchored ? rendered : ["", ...rendered];
 		this.lineCache = animating ? undefined : { key, lines: result };
 		return result;
@@ -1323,7 +1364,9 @@ function restoreHistoricalThinking(component: any, content: any[], reportedToken
 		const exact = runs.size === 1 && typeof reportedTokens === "number" && Number.isFinite(reportedTokens) && reportedTokens > 0;
 		group.thinkingTokensFrozen = exact ? reportedTokens : estimateTextTokens(group.thinkingFrozen);
 		group.thinkingTokensFrozenExact = exact;
-		group.setExpanded(state.expanded ?? false);
+		// 已有组保留单独点击的展开状态；Ctrl+O 已直接更新组，不需重建时再次覆盖。
+		if (!previous.has(index)) group.setExpanded(state.expanded ?? false);
+		else group.markDirty(); // 思考正文/token 可能改变，保留展开状态但不能复用旧行。
 		groups.add(group);
 		state.historyGroups.set(index, group);
 		if (index < ordinal) state.anchors.set(index, group);

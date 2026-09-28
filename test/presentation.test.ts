@@ -26,7 +26,7 @@ test("折叠严格三行，失败项不被较新的成功项掩盖", () => {
 	const component = new CompactExternalGroupComponent(fixture(), plainTheme);
 	const lines = component.render(80).map(stripTerminalSequences);
 	assert.equal(lines.length, 3);
-	assert.match(lines[0]!, /3 个工具 · 1 失败/);
+	assert.match(lines[0]!, /read ×1 · bash ×1 · mcp ×1 · 1 失败/);
 	assert.match(lines[0]!, /思考 1.2K/);
 	assert.match(lines[1]!, /✗ bash.*断言失败/);
 	assert.match(lines[2]!, /╰.*验证过期/);
@@ -58,12 +58,12 @@ test("宽终端的标题 token 和工具耗时就近显示，不填充整行", (
 	state.thinking = "";
 	const component = new CompactExternalGroupComponent(state, plainTheme);
 	assert.deepEqual(component.render(240), [
-		" ▸ 2 个工具",
+		" ▸ bash ×2",
 		" │  ✓ bash  pi --help 2>&1 | head -60 · 9.7s",
 		" ╰  ✓ bash  pi list 2>&1 · 5.0s",
 	]);
 	state.thinking = "检查帮助信息";
-	assert.equal(component.render(240)[0], " ▸ 2 个工具 · 思考 1.2K");
+	assert.equal(component.render(240)[0], " ▸ bash ×2 · 思考 1.2K");
 	assert.equal(component.render(80)[0], component.render(240)[0]);
 });
 
